@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
+import time
 import uuid
 from collections.abc import Callable
 from typing import Any
@@ -34,6 +36,11 @@ from .tasks import Task
 from .versions import coerce_resolver
 
 log = logging.getLogger("despise.client")
+
+# Default retry parameters for boot()
+BOOT_MAX_RETRIES = 3
+BOOT_INITIAL_DELAY = 1.0
+BOOT_MAX_DELAY = 10.0
 
 
 class Client:
@@ -295,21 +302,51 @@ class Client:
         """Restart-only refresh: resolve versions, rebuild profile, set token."""
         if self._booted:
             return
-        versions = await self.version_resolver.resolve(self.http.session)
-        self.profile = build_profile(
-            self._preset,
-            versions,
-            locale=self._locale,
-            timezone=self._timezone,
-            hardware_concurrency=self._hardware_concurrency,
-            screen_resolution=self._screen_resolution,
-            device_memory=self._device_memory,
-        )
-        # Rebuild session headers around the new profile (same session!).
-        self.http.set_profile(self.profile)
-        self.http.set_token(self.token)
-        self.gateway.http = self.http
-        self._booted = True
+        
+        # Retry logic for version resolution with exponential backoff
+        for attempt in range(BOOT_MAX_RETRIES + 1):
+            try:
+                versions = await self.version_resolver.resolve(self.http.session)
+                self.profile = build_profile(
+                    self._preset,
+                    versions,
+                    locale=self._locale,
+                    timezone=self._timezone,
+                    hardware_concurrency=self._hardware_concurrency,
+                    screen_resolution=self._screen_resolution,
+                    device_memory=self._device_memory,
+                )
+                # Rebuild session headers around the new profile (same session!).
+                self.http.set_profile(self.profile)
+                self.http.set_token(self.token)
+                self.gateway.http = self.http
+                self._booted = True
+                return
+            except (DespiseError, Forbidden, NotFound) as e:
+                if attempt == BOOT_MAX_RETRIES:
+                    raise
+                delay = min(BOOT_INITIAL_DELAY * (2 ** attempt), BOOT_MAX_DELAY)
+                if attempt:
+                    log.info(
+                        "boot() attempt %d/%d failed: %r, retrying in %.1fs",
+                        attempt + 1,
+                        BOOT_MAX_RETRIES,
+                        e,
+                        delay,
+                    )
+                await asyncio.sleep(delay)
+            except Exception as e:
+                # Network errors or other exceptions - also retry
+                if attempt == BOOT_MAX_RETRIES:
+                    raise
+                delay = min(BOOT_INITIAL_DELAY * (2 ** attempt), BOOT_MAX_DELAY)
+                if attempt:
+                    log.info(
+                        "boot() unexpected error: %r, retrying in %.1fs",
+                        e,
+                        delay,
+                    )
+                await asyncio.sleep(delay)
 
     async def start(self) -> Client:
         """Boot + handshake. Returns once READY; keeps running in background."""

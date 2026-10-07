@@ -96,6 +96,7 @@ class TypingLoop:
     def start(self) -> TypingLoop:
         """Send immediately, then refresh on the interval. Idempotent."""
         if self._task is not None and not self._task.done():
+            self._stopping = False
             return self
         self._stopping = False
         self._task = asyncio.create_task(

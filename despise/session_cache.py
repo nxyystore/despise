@@ -32,6 +32,7 @@ cashews is an optional dependency::
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import time
 from dataclasses import dataclass
@@ -99,7 +100,9 @@ class SessionCache:
         self._closed = False
         # A distinct name per token: cashews instances do not share state,
         # which is exactly the isolation we want between tokens.
-        self._cache = cache_cls(name=name or f"despise-gw-{abs(hash(token)) % (1 << 32)}")
+        # Use hashlib for a stable hash that's consistent across runs.
+        token_hash = hashlib.md5(token.encode("utf-8")).hexdigest()
+        self._cache = cache_cls(name=name or f"despise-gw-{token_hash}")
         self._cache.setup(backend)  # sync in cashews 7.x -- do NOT await
 
     async def load(self) -> SessionState | None:

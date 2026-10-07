@@ -119,8 +119,9 @@ class EntityCache:
     def put_member(self, member: Member) -> None:
         if member.user is not None:
             self.put_user(member.user)
-        key = f"{member.guild_id}:{member.id}"
-        self.members.put(key, member)
+        if member.guild_id:
+            key = f"{member.guild_id}:{member.id}"
+            self.members.put(key, member)
 
     def put_message_author(self, user: User) -> None:
         self.put_user(user)

@@ -512,7 +512,7 @@ class Message(Model):
         payload = self._raw
         self.channel_id = str(payload.get("channel_id", ""))
         self.guild_id = str(payload.get("guild_id") or "")
-        self.author = _nested(payload, "author", User) or User(None)
+        self.author = _nested(payload, "author", User) or None
         self.member = _nested(payload, "member", Member)
         self.content = payload.get("content", "") or ""
         self.timestamp = parse_timestamp(payload.get("timestamp"))

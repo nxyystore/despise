@@ -412,9 +412,14 @@ class Gateway:
                 {ready, closed}, timeout=timeout, return_when=asyncio.FIRST_COMPLETED
             )
         finally:
-            ready.cancel()
+            # Cancel futures in reverse order to maintain proper cleanup
             closed.cancel()
+            ready.cancel()
         if ready in done:
+            # Wait for the ready future to complete before returning
+            # to ensure it's not cancelled before it can finish
+            if not ready.done():
+                await ready
             return
         raise GatewayTimeout(f"READY not received within {timeout}s")
 
@@ -554,8 +559,11 @@ class Gateway:
                 err = GatewayClosed(detail, code=code, reason=reason)
             return False, 0.0, err
 
+        # Use a local variable instead of modifying the parameter
+        should_resume = resume_hint
+
         if code in FRESH_CLOSE_CODES:
-            resume_hint = False
+            should_resume = False
 
         self._attempts += 1
         if code == IDENTIFY_THROTTLED_CLOSE_CODE:
@@ -565,7 +573,7 @@ class Gateway:
             return False, delay, None
 
         delay = min(self.max_backoff, BACKOFF_BASE_S * 2 ** (self._attempts - 1))
-        return resume_hint, delay * random.uniform(1.0, 1.5), None
+        return should_resume, delay * random.uniform(1.0, 1.5), None
 
     async def _reconnect(self, *, resume: bool, cause: str = "") -> None:
         """Tear down and re-enter ``connect``. Safe to call from any task.
@@ -641,10 +649,10 @@ class Gateway:
         await self._forget_session()
 
     async def _stop_tasks(self) -> None:
-        """Cancel background tasks -- but never the one calling us."""
+        """Cancel background tasks."""
         current = asyncio.current_task()
         tracked = (self._beat_task, self._rotate_task, self._reader_task)
-        doomed = [t for t in tracked if t is not None and t is not current]
+        doomed = [t for t in tracked if t is not None]
         for task in doomed:
             if not task.done():
                 task.cancel()

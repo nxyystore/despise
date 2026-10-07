@@ -215,9 +215,14 @@ class DespiseHttp:
                 target = self._buckets.setdefault(f"b:{bucket_id}", RateLimitBucket())
                 if bucket.reset_at > target.reset_at:
                     target.reset_at = bucket.reset_at
+                # Preserve the old bucket's reset_at before removing it
+                old_reset_at = bucket.reset_at
                 if known is None:
                     self._buckets.pop(route, None)
                 bucket = target
+                # Copy the old bucket's reset_at to the new bucket as well
+                if old_reset_at > bucket.reset_at:
+                    bucket.reset_at = old_reset_at
         if scope == "user":
             # The reset belongs to the account-wide bucket, not ours.
             bucket = self._user_bucket
@@ -299,14 +304,17 @@ class DespiseHttp:
                     data=data,
                     local_path=local_path,
                 )
-            return await self._send(
+            result = await self._send(
                 method,
                 path,
                 multipart=mime,
                 reason=reason,
             )
-        finally:
             mime.close()
+            return result
+        except Exception:
+            mime.close()
+            raise
 
     async def _send(
         self,
