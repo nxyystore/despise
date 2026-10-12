@@ -113,17 +113,21 @@ class EntityCache:
                         return
                 cached.channels.append(channel)
 
-    def put_user(self, user: User) -> None:
+    def put_user(self, user: User | None) -> None:
+        if user is None or not user.id:
+            return
         self.users.put(user.id, user)
 
-    def put_member(self, member: Member) -> None:
+    def put_member(self, member: Member | None) -> None:
+        if member is None:
+            return
         if member.user is not None:
             self.put_user(member.user)
         if member.guild_id:
             key = f"{member.guild_id}:{member.id}"
             self.members.put(key, member)
 
-    def put_message_author(self, user: User) -> None:
+    def put_message_author(self, user: User | None) -> None:
         self.put_user(user)
 
     def drop_guild(self, guild_id: str) -> None:

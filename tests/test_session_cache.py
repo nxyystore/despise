@@ -196,18 +196,27 @@ def test_for_token_builds_from_a_backend_url():
     assert run(main()).session_id == "s"
 
 
-def test_missing_cashews_gives_an_actionable_error(monkeypatch):
-    import builtins
-
+def test_no_extra_needed_for_builtin_cache():
+    """Regression: the cache used to require `pip install despise[session-cache]`."""
     import despise.session_cache as mod
 
-    real_import = builtins.__import__
+    assert not hasattr(mod, "_INSTALL_HINT")
+    cache = SessionCache("tok-X")
 
-    def fake_import(name, *args, **kwargs):
-        if name == "cashews":
-            raise ImportError("no module named cashews")
-        return real_import(name, *args, **kwargs)
+    async def main():
+        assert await cache.save("s", 1) is True
+        state = await cache.load()
+        await cache.close()
+        return state
 
-    monkeypatch.setattr(builtins, "__import__", fake_import)
-    with pytest.raises(ImportError, match=r"despise\[session-cache\]"):
-        mod.SessionCache("tok-X")
+    assert run(main()).session_id == "s"
+
+
+def test_redis_url_parses_without_extra_deps():
+    from despise.session_cache import _RedisBackend
+
+    cache = SessionCache("tok-R", backend="redis://127.0.0.1:6379/0")
+    assert isinstance(cache._cache, _RedisBackend)
+    assert cache._cache.host == "127.0.0.1"
+    assert cache._cache.port == 6379
+    run(cache.close())

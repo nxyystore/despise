@@ -1,4 +1,4 @@
-"""Per-token gateway session cache (optional, ``cashews``-backed).
+"""Per-token gateway session cache (built in, zero dependencies).
 
 Why this exists: Discord only lets a client *resume* a gateway session when it
 still holds that session's ``session_id`` and last ``seq``. Lose them and the
@@ -15,26 +15,29 @@ Keying by token (not by user id) matters: the same account can have several
 tokens, and swapping a token under a user id must never resurrect the wrong
 session.
 
-Backends are pluggable:
+Backends are built in (no optional extras):
 
 - ``mem://`` (default) -- in-memory only. Isolates tokens from each other,
-  costs no disk I/O, and dies with the process.
-- ``redis://redis/0`` -- survives a process restart and is shared across
-  workers. This is the only backend that actually delivers "resume after a
+  costs no disk I/O, and dies with the process. ``mem://?size=N`` caps the
+  number of entries (default 1000).
+- ``redis://host:port/db`` (and ``rediss://`` for TLS) -- survives a process
+  restart and is shared across workers, over a minimal stdlib-asyncio RESP
+  client. This is the only backend that actually delivers "resume after a
   restart"; with ``mem://`` the cache still helps *within* one process
   (multiple clients sharing a token, a client rebuilt in-place).
-
-cashews is an optional dependency::
-
-    pip install despise[session-cache]         # mem://
-    pip install despise[session-cache-redis]   # redis://
 """
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import hashlib
+import json
 import logging
+import ssl
 import time
+import urllib.parse
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any
 
@@ -51,18 +54,165 @@ DEFAULT_TTL_S = 3600.0
 # entry per message would be absurd. READY/RESUMED use force=True.
 DEFAULT_MIN_SAVE_INTERVAL_S = 30.0
 
-_INSTALL_HINT = (
-    "session cache requires cashews; install it with "
-    "`pip install despise[session-cache]` (or `despise[session-cache-redis]`)"
-)
+DEFAULT_MEM_SIZE = 1000
 
 
-def _load_cache_class() -> Any:
+def _parse_mem_size(backend: str) -> int:
     try:
-        from cashews import Cache
-    except ImportError as exc:  # pragma: no cover - depends on the install
-        raise ImportError(_INSTALL_HINT) from exc
-    return Cache
+        query = urllib.parse.urlsplit(backend).query
+        size = int(urllib.parse.parse_qs(query).get("size", [DEFAULT_MEM_SIZE])[0])
+        return size if size > 0 else DEFAULT_MEM_SIZE
+    except (ValueError, TypeError):
+        return DEFAULT_MEM_SIZE
+
+
+class _MemoryBackend:
+    """Async dict with per-key TTL and an LRU-ish size cap."""
+
+    def __init__(self, max_size: int = DEFAULT_MEM_SIZE) -> None:
+        self._data: OrderedDict[str, tuple[Any, float | None]] = OrderedDict()
+        self._max_size = max_size
+        self._lock = asyncio.Lock()
+
+    async def get(self, key: str, default: Any = None) -> Any:
+        async with self._lock:
+            entry = self._data.get(key)
+            if entry is None:
+                return default
+            value, expires_at = entry
+            if expires_at is not None and time.monotonic() >= expires_at:
+                del self._data[key]
+                return default
+            # LRU touch so hot sessions survive the size cap.
+            self._data.move_to_end(key)
+            return value
+
+    async def set(self, key: str, value: Any, expire: float | None = None, **_: Any) -> None:
+        # Accept `ttl` as an alias for cashews-compat callers.
+        expires_at = time.monotonic() + expire if expire else None
+        async with self._lock:
+            if key in self._data:
+                self._data.move_to_end(key)
+            self._data[key] = (value, expires_at)
+            while len(self._data) > self._max_size:
+                self._data.popitem(last=False)
+
+    async def delete(self, key: str) -> None:
+        async with self._lock:
+            self._data.pop(key, None)
+
+    async def close(self) -> None:
+        async with self._lock:
+            self._data.clear()
+
+
+class _RedisBackend:
+    """Minimal stdlib asyncio Redis client (GET/SET/DEL only).
+
+    Opens a short-lived connection per operation: session saves are throttled
+    to ~1/30s, so connection setup cost is negligible and we avoid reconnect
+    state machines. Any failure raises, and the caller degrades to
+    "no session, re-identify".
+    """
+
+    def __init__(self, url: str) -> None:
+        parsed = urllib.parse.urlparse(url)
+        if parsed.scheme not in ("redis", "rediss"):
+            raise ValueError(f"unsupported redis URL: {url!r}")
+        self.host = parsed.hostname or "127.0.0.1"
+        self.port = parsed.port or 6379
+        self.db = 0
+        if parsed.path and parsed.path != "/":
+            try:
+                self.db = int(parsed.path.lstrip("/"))
+            except ValueError:
+                self.db = 0
+        self.password = parsed.password
+        self.ssl_context = ssl.create_default_context() if parsed.scheme == "rediss" else None
+        self._selected = self.db == 0 and self.password is None
+
+    @staticmethod
+    def _encode(*args: Any) -> bytes:
+        parts = [f"*{len(args)}\r\n".encode()]
+        for arg in args:
+            raw = arg if isinstance(arg, bytes) else str(arg).encode()
+            parts += [f"${len(raw)}\r\n".encode(), raw, b"\r\n"]
+        return b"".join(parts)
+
+    async def _roundtrip(self, *args: Any) -> Any:
+        reader, writer = await asyncio.open_connection(
+            self.host, self.port, ssl=self.ssl_context
+        )
+        try:
+            if self.password:
+                await self._command(reader, writer, "AUTH", self.password)
+            if self.db:
+                await self._command(reader, writer, "SELECT", self.db)
+            return await self._command(reader, writer, *args)
+        finally:
+            writer.close()
+            with contextlib.suppress(Exception):  # pragma: no cover - best effort
+                await writer.wait_closed()
+
+    async def _command(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, *args: Any) -> Any:
+        writer.write(self._encode(*args))
+        await writer.drain()
+        return await self._read_reply(reader)
+
+    async def _read_reply(self, reader: asyncio.StreamReader) -> Any:
+        line = await reader.readline()
+        if not line:
+            raise ConnectionError("redis closed the connection")
+        kind, payload = line[:1], line[1:-2].decode(errors="replace")
+        if kind == b"+":  # simple string
+            return payload
+        if kind == b"-":  # error
+            raise ConnectionError(f"redis error: {payload}")
+        if kind == b":":  # integer
+            return int(payload)
+        if kind == b"$":  # bulk string
+            length = int(payload)
+            if length == -1:
+                return None
+            data = await reader.readexactly(length + 2)
+            return data[:-2]
+        if kind == b"*":  # array
+            count = int(payload)
+            if count == -1:
+                return None
+            return [await self._read_reply(reader) for _ in range(count)]
+        raise ConnectionError(f"unexpected redis reply: {line!r}")
+
+    async def get(self, key: str, default: Any = None) -> Any:
+        raw = await self._roundtrip("GET", key)
+        if raw is None:
+            return default
+        if isinstance(raw, bytes):
+            raw = raw.decode()
+        try:
+            return json.loads(raw)
+        except (ValueError, TypeError):
+            return raw
+
+    async def set(self, key: str, value: Any, expire: float | None = None, **_: Any) -> None:
+        payload = value if isinstance(value, str) else json.dumps(value)
+        if expire:
+            await self._roundtrip("SET", key, payload, "EX", int(expire))
+        else:
+            await self._roundtrip("SET", key, payload)
+
+    async def delete(self, key: str) -> None:
+        await self._roundtrip("DEL", key)
+
+    async def close(self) -> None:
+        return None
+
+
+def _build_backend(backend: str) -> Any:
+    if backend.startswith(("redis://", "rediss://")):
+        return _RedisBackend(backend)
+    # Everything else is in-memory ("mem://", "mem://?size=N", "" ...).
+    return _MemoryBackend(_parse_mem_size(backend or "mem://"))
 
 
 @dataclass(slots=True)
@@ -91,19 +241,18 @@ class SessionCache:
         min_save_interval: float = DEFAULT_MIN_SAVE_INTERVAL_S,
         name: str | None = None,
     ) -> None:
-        cache_cls = _load_cache_class()
         self.token = token
         self.key = f"{KEY_PREFIX}:{token}"
         self.ttl = ttl
         self.min_save_interval = min_save_interval
+        self.backend = backend
         self._last_save = 0.0
         self._closed = False
-        # A distinct name per token: cashews instances do not share state,
-        # which is exactly the isolation we want between tokens.
-        # Use hashlib for a stable hash that's consistent across runs.
+        # A distinct backend per instance: nothing is shared unless the caller
+        # goes through for_token(). Use hashlib for a stable, non-secret hash.
         token_hash = hashlib.md5(token.encode("utf-8")).hexdigest()
-        self._cache = cache_cls(name=name or f"despise-gw-{token_hash}")
-        self._cache.setup(backend)  # sync in cashews 7.x -- do NOT await
+        self.name = name or f"despise-gw-{token_hash}"
+        self._cache = _build_backend(backend)
 
     async def load(self) -> SessionState | None:
         if self._closed:

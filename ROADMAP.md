@@ -98,14 +98,14 @@ underneath it had bugs that would bite before any fingerprint work mattered.*
 - [x] Track `max_concurrency` from READY. `subscribe_guild` refuses over the
       cap locally (`TooManySubscriptions`) instead of earning a 4013
       reconnect; slots free via `unsubscribe_guild` or `GUILD_DELETE`.
-- [x] Cache `session_id` / `seq` / `resume_url` in a **`cashews` cache keyed
-      per token** (`despise:gw:session:{token}`), not on disk.
+- [x] Cache `session_id` / `seq` / `resume_url` in a **built-in cache keyed
+      per token** (`despise:gw:session:{token}`), not on disk. Zero deps.
       - Backend is pluggable: `mem://` (default) or `redis://` via
-        `Client(session_cache="redis://...")`.
+        `Client(session_cache="redis://...")`, both stdlib-only.
       - Per-token keying, never by user id — a token swapped under the same
         user must not resurrect the old session.
-      - Per-token `Cache(name=...)`, not the module singleton: cashews
-        instances share nothing (verified).
+      - Per-instance backends, not a module singleton: instances share nothing
+        unless they come from the `for_token` registry.
       - TTL (1h default) so an abandoned token can't resurrect a stale
         session; writes throttled to 30s except on READY/RESUMED, because
         `seq` advances on every dispatch.
@@ -118,24 +118,6 @@ underneath it had bugs that would bite before any fingerprint work mattered.*
       - **Tradeoff:** `mem://` does *not* survive a process restart, so
         "resume instead of re-identify after a restart" needs `redis://`.
         In-memory still buys token isolation and in-process handoff.
-
-> **cashews 7.6.0 API — verified locally, differs from the upstream README.**
->
-> ```python
-> from cashews import Cache            # or: from cashews import cache  (singleton)
->
-> c = Cache("despise")                 # name is arbitrary; gives isolation
-> c.setup("mem://?size=1000")          # SYNC — returns a Backend, do NOT await
-> await c.set(key, value, expire=3600)  # kwarg is `expire`, not `ttl`
-> await c.get(key, default=None)
-> await c.delete(key)
-> await c.close()
-> ```
->
-> Gotchas: `cache.setup(...)` is not awaitable in 7.6 (it was typed as a
-> coroutine in some 7.x builds — don't trust the signature); `is_setup` is a
-> *method*, not a property; `mem://` stores dicts natively, no serialization
-> needed.
 - [x] Re-identify carries the current `presence`. Correctly still omitted on
       the *first* identify.
 - [x] op 12 lazy member-list sync. `lazy_load_members(guild_id)` sends op 8

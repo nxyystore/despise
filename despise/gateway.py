@@ -1,7 +1,7 @@
 """Gateway lifecycle: Hello/Identify/READY/dispatch/resume/QoS.
 
 Borrows the ONE shared session from DespiseHttp (same impersonate/proxy).
-Single heartbeat task. No zlib-stream (json encoding, v1 scope).
+Single heartbeat task. zlib-stream encoding by default, plain json on request.
 
 Lifecycle contract:
 - ``connect()`` performs the handshake, hands the socket to a *tracked*
@@ -103,10 +103,9 @@ class Gateway:
         http: DespiseHttp,
         token: str,
         *,
-        intents: int = 0,
         listeners: dict | None = None,
         max_backoff: float = BACKOFF_MAX_S,
-        encoding: str = "json",
+        encoding: str = "zlib-stream",
         session_cache: Any = None,
     ) -> None:
         if encoding not in GATEWAY_ENCODINGS:
@@ -116,7 +115,6 @@ class Gateway:
             )
         self.http = http
         self.token = token
-        self.intents = intents
         self.encoding = encoding
         self.session_cache = session_cache
         self.listeners: dict[str, list] = dict(listeners or {})
@@ -225,7 +223,6 @@ class Gateway:
             ),
             "compress": False,
             "large_threshold": 250,
-            "intents": self.intents,
             "capabilities": CAPABILITIES,
             "client_state": {"guild_versions": {}, "api_code_version": 0},
         }

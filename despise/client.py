@@ -17,6 +17,7 @@ tasks; an await that returned would let the caller -- and usually
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import random
 import time
@@ -49,7 +50,6 @@ class Client:
         token: str,
         *,
         profile: str = "web",
-        intents: int = 0,
         locale: str | None = None,
         timezone: str | None = None,
         hardware_concurrency: int | None = None,
@@ -58,7 +58,7 @@ class Client:
         proxy: str | None = None,
         timeout: float = 30.0,
         api_base: str | None = None,
-        gateway_encoding: str = "json",
+        gateway_encoding: str = "zlib-stream",
         session_cache: bool | str = False,
         version_resolver=None,
         cache_caps: tuple[int, int, int] | None = None,
@@ -90,7 +90,7 @@ class Client:
                 f"expected one of {GATEWAY_ENCODINGS}"
             )
         # `session_cache=True` -> in-memory; pass a URL ("redis://...") for
-        # a backend that survives a restart. Requires cashews.
+        # a backend that survives a restart. Built in, no extra install.
         self.session_cache: SessionCache | None = None
         if session_cache is not False and session_cache is not None:
             from .session_cache import for_token
@@ -100,19 +100,136 @@ class Client:
         self.gateway = Gateway(
             self.http,
             token,
-            intents=intents,
             encoding=gateway_encoding,
             session_cache=self.session_cache,
         )
         self._booted = False
         self.cache = EntityCache(*cache_caps) if cache_caps else EntityCache()
+        self._listeners: dict[str, list] = {}
+        self._raw_listeners: dict[str, list] = {}
+        self._client_waiters: dict[str, list] = {}
+        self._bridged: set[str] = set()
+        # Bridge every known dispatch up front. Seeding (READY guilds) and
+        # wait_for must work even when the user registers no listeners.
+        from .events import RAW_TO_FRIENDLY as _RAW_TO_FRIENDLY
+
+        for _raw in _RAW_TO_FRIENDLY:
+            self._ensure_bridge(_raw)
         self.tasks: list[Task] = []
         self.version_resolver = coerce_resolver(version_resolver)
         self._register_cache_listeners()
 
     # -- events ---------------------------------------------------------
-    def on(self, event: str, coro) -> None:
-        self.gateway.on(event, coro)
+    # Friendly discord.py-self style names on top of raw gateway dispatches.
+    # ``bot.on("message", ...)`` and ``@bot.event async def on_message(m)``
+    # receive a model. ``bot.on("MESSAGE_CREATE", ...)`` still receives the
+    # raw dict, exactly as before.
+    def on(self, event: str, coro=None):
+        from .events import RAW_TO_FRIENDLY, normalize, raw_for
+
+        upper = event.strip().upper().replace(" ", "_")
+        if upper in RAW_TO_FRIENDLY:
+            self._raw_listeners.setdefault(upper, []).append(coro)
+            self._ensure_bridge(upper)
+        else:
+            self._listeners.setdefault(normalize(event), []).append(coro)
+            raw = raw_for(event)
+            if raw is not None:
+                self._ensure_bridge(raw)
+        return coro
+
+    def _ensure_bridge(self, raw: str) -> None:
+        if raw in self._bridged:
+            return
+        self._bridged.add(raw)
+
+        async def _bridge(payload) -> None:
+            await self._handle_raw(raw, payload)
+
+        self.gateway.on(raw, _bridge)
+
+    async def _handle_raw(self, raw: str, payload) -> None:
+        from .events import NO_ARG_EVENTS, convert
+
+        if raw == "READY":
+            self._seed_from_ready(payload)
+        friendly, value = convert(raw, payload)
+        targets: list[tuple] = []
+        if friendly is not None and friendly not in NO_ARG_EVENTS:
+            targets += [(c, value) for c in self._listeners.get(friendly, ())]
+        elif friendly in NO_ARG_EVENTS:
+            targets += [(c, None) for c in self._listeners.get(friendly, ())]
+        targets += [(c, payload) for c in self._raw_listeners.get(raw, ())]
+        for coro, arg in targets:
+            try:
+                res = coro() if arg is None else coro(arg)
+                if inspect.isawaitable(res):
+                    await res
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                await self._dispatch_error(friendly or raw, exc)
+        await self._settle_client_waiters(raw, friendly, payload, value)
+
+    def _seed_from_ready(self, payload) -> None:
+        """Feed the entity cache from READY's embedded guilds and DMs.
+
+        READY arrives with full guild objects (channels, roles, members),
+        not follow-up GUILD_CREATEs, so without this every ``get_guild``
+        after connect burns a REST call. Never raises; a malformed READY
+        must not break the handshake.
+        """
+        try:
+            if not isinstance(payload, dict):
+                return
+            from .models import Channel, Guild
+
+            for g in payload.get("guilds", []) or []:
+                if isinstance(g, dict) and not g.get("unavailable"):
+                    try:
+                        self.cache.put_guild(Guild(g))
+                    except Exception:
+                        continue
+            for c in payload.get("private_channels", []) or []:
+                if isinstance(c, dict):
+                    try:
+                        self.cache.put_channel(Channel(c))
+                    except Exception:
+                        continue
+        except Exception:
+            log.exception("seeding cache from READY failed")
+
+    async def _settle_client_waiters(self, raw: str, friendly: str | None, payload, value) -> None:
+        from .events import NO_ARG_EVENTS
+
+        settled: list[tuple] = []
+        if friendly is not None:
+            settled += [(w, value if friendly not in NO_ARG_EVENTS else None)
+                        for w in self._client_waiters.get(friendly, ())]
+        settled += [(w, payload) for w in self._client_waiters.get(raw, ())]
+        if friendly is not None:
+            settled += [(w, value) for w in self._client_waiters.get(raw.lower(), ())]
+        for (fut, check), arg in settled:
+            if fut.done():
+                continue
+            try:
+                matched = check is None or check(arg)
+                if inspect.isawaitable(matched):
+                    matched = await matched
+            except Exception as exc:
+                fut.set_exception(exc)
+                continue
+            if matched:
+                fut.set_result(arg)
+
+    async def _dispatch_error(self, event: str, exc: BaseException) -> None:
+        for handler in list(getattr(self.gateway, "error_listeners", ())):
+            try:
+                res = handler(event, exc)
+                if inspect.isawaitable(res):
+                    await res
+            except Exception:
+                log.exception("client on_error handler failed")
 
     def _register_cache_listeners(self) -> None:
         """Keep the entity cache fed from dispatches.
@@ -161,16 +278,16 @@ class Client:
                     if message.member is not None:
                         self.cache.put_member(message.member)
 
-        self.on("GUILD_CREATE", on_guild)
-        self.on("GUILD_UPDATE", on_guild)
-        self.on("GUILD_DELETE", on_guild_delete)
-        self.on("CHANNEL_CREATE", on_channel)
-        self.on("CHANNEL_UPDATE", on_channel)
-        self.on("CHANNEL_DELETE", on_channel_delete)
-        self.on("GUILD_MEMBER_ADD", on_member)
-        self.on("GUILD_MEMBER_UPDATE", on_member)
-        self.on("MESSAGE_CREATE", on_message)
-        self.on("MESSAGE_UPDATE", on_message)
+        self.gateway.on("GUILD_CREATE", on_guild)
+        self.gateway.on("GUILD_UPDATE", on_guild)
+        self.gateway.on("GUILD_DELETE", on_guild_delete)
+        self.gateway.on("CHANNEL_CREATE", on_channel)
+        self.gateway.on("CHANNEL_UPDATE", on_channel)
+        self.gateway.on("CHANNEL_DELETE", on_channel_delete)
+        self.gateway.on("GUILD_MEMBER_ADD", on_member)
+        self.gateway.on("GUILD_MEMBER_UPDATE", on_member)
+        self.gateway.on("MESSAGE_CREATE", on_message)
+        self.gateway.on("MESSAGE_UPDATE", on_message)
 
     # -- cached lookups -------------------------------------------------
     async def get_guild(self, guild_id: str):
@@ -251,15 +368,55 @@ class Client:
         self.tasks.clear()
 
     def event(self, coro):
-        """Decorator form: registers ``coro`` under its own name."""
-        self.gateway.on(coro.__name__, coro)
+        """Decorator form: ``on_message`` registers for ``message``.
+
+        Strips the ``on_`` prefix and normalizes, so ``on_ready``,
+        ``on_message``, and ``on_guild_join`` land on ``ready``,
+        ``message``, and ``guild_join``.
+        """
+        self.on(coro.__name__, coro)
         return coro
+
+    def listen(self, name: str | None = None):
+        """Decorator form with an explicit name: ``@bot.listen("message")``."""
+
+        def decorator(coro):
+            self.on(name or coro.__name__, coro)
+            return coro
+
+        return decorator
 
     def on_error(self, coro) -> None:
         self.gateway.on_error(coro)
 
-    async def dispatch(self, event: str, *args) -> None:
-        await self.gateway._emit(event, *args)
+    async def dispatch(self, event: str, payload=None) -> None:
+        """Emit an event to client listeners, converting the payload.
+
+        Accepts friendly (``"message"``) or raw (``"MESSAGE_CREATE"``)
+        names. Raw listeners receive the payload untouched.
+        """
+        from .events import RAW_TO_FRIENDLY, normalize, raw_for
+
+        upper = event.strip().upper().replace(" ", "_")
+        raw = upper if upper in RAW_TO_FRIENDLY else raw_for(event)
+        if raw is not None:
+            # One path: gateway._emit reaches the cache listeners and the
+            # bridge, which fans out to friendly/raw client listeners.
+            self._ensure_bridge(raw)
+            await self.gateway._emit(raw, payload)
+        else:
+            friendly = normalize(event)
+            await self.gateway._emit(event, payload)
+            for coro in list(self._listeners.get(friendly, ())):
+                try:
+                    res = coro() if payload is None else coro(payload)
+                    if inspect.isawaitable(res):
+                        await res
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    await self._dispatch_error(friendly, exc)
+            await self._settle_client_waiters(friendly, friendly, payload, payload)
 
     async def wait_for(
         self,
@@ -268,7 +425,28 @@ class Client:
         check: Callable[[Any], Any] | None = None,
         timeout: float | None = None,
     ):
-        return await self.gateway.wait_for(event, check=check, timeout=timeout)
+        """Wait for the next matching event. Friendly or raw names work.
+
+        The ``check`` sees what a listener sees: a model for friendly
+        names (``m.author.id``), the raw dict for raw names.
+        """
+        from .events import RAW_TO_FRIENDLY, normalize, raw_for
+
+        upper = event.strip().upper().replace(" ", "_")
+        key = upper if upper in RAW_TO_FRIENDLY else normalize(event)
+        raw = upper if upper in RAW_TO_FRIENDLY else raw_for(event)
+        if raw is not None:
+            self._ensure_bridge(raw)
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future = loop.create_future()
+        self._client_waiters.setdefault(key, []).append((fut, check))
+        try:
+            return await asyncio.wait_for(asyncio.shield(fut), timeout)
+        finally:
+            bucket = self._client_waiters.get(key, [])
+            self._client_waiters[key] = [(f, c) for f, c in bucket if f is not fut]
+            if not self._client_waiters[key]:
+                self._client_waiters.pop(key, None)
 
     async def wait_until_ready(self, timeout: float | None = None) -> None:
         if timeout is None:

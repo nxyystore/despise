@@ -182,10 +182,79 @@ def test_event_decorator_registers_under_its_name(monkeypatch):
     c, _ = patched(monkeypatch)
 
     @c.event
-    async def on_ready(data):
-        return data
+    async def on_ready():
+        return None
 
-    assert c.gateway.listeners["on_ready"] == [on_ready]
+    assert c._listeners["ready"] == [on_ready]
+
+
+def test_event_decorator_strips_on_prefix(monkeypatch):
+    c, gw = patched(monkeypatch)
+    seen = {}
+
+    @c.event
+    async def on_message(message):
+        seen["id"] = message.id
+        seen["author"] = message.author.id
+
+    payload = {
+        "id": "m1",
+        "channel_id": "c1",
+        "content": "hi",
+        "author": {"id": "u1", "username": "a"},
+    }
+    run(gw._emit("MESSAGE_CREATE", payload))
+    assert seen == {"id": "m1", "author": "u1"}
+    assert isinstance(gw.listeners["MESSAGE_CREATE"][-1].__name__, str)
+
+
+def test_on_message_receives_a_model(monkeypatch):
+    from despise.models import Message
+
+    c, gw = patched(monkeypatch)
+    seen = {}
+    c.on("message", lambda m: seen.setdefault("m", m))
+    payload = {
+        "id": "m2",
+        "channel_id": "c1",
+        "content": "hey",
+        "author": {"id": "u2", "username": "b"},
+    }
+    run(gw._emit("MESSAGE_CREATE", payload))
+    assert isinstance(seen["m"], Message)
+    assert seen["m"].content == "hey"
+    assert seen["m"].author.id == "u2"
+
+
+def test_on_raw_name_still_gets_the_raw_dict(monkeypatch):
+    c, gw = patched(monkeypatch)
+    seen = {}
+    c.on("MESSAGE_CREATE", lambda d: seen.setdefault("d", d))
+    payload = {"id": "m3", "author": {"id": "u3"}}
+    run(gw._emit("MESSAGE_CREATE", payload))
+    assert seen["d"] == payload
+
+
+def test_wait_for_message_passes_a_model(monkeypatch):
+    c, gw = patched(monkeypatch)
+
+    async def main():
+        waiter = asyncio.ensure_future(
+            c.wait_for("message", check=lambda m: m.author.id == "u9")
+        )
+        await asyncio.sleep(0)
+        await gw._emit(
+            "MESSAGE_CREATE",
+            {"id": "no", "author": {"id": "u1", "username": "x"}},
+        )
+        await gw._emit(
+            "MESSAGE_CREATE",
+            {"id": "yes", "author": {"id": "u9", "username": "y"}},
+        )
+        return await asyncio.wait_for(waiter, 1)
+
+    found = run(main())
+    assert found.id == "yes"
 
 
 def test_on_error_registration(monkeypatch):
@@ -200,8 +269,10 @@ def test_on_error_registration(monkeypatch):
 
 def test_dispatch_routes_through_emit(monkeypatch):
     c, gw = patched(monkeypatch)
-    run(c.dispatch("MESSAGE_CREATE", {"id": "m1"}))
-    assert gw._emit_calls == [("MESSAGE_CREATE", ({"id": "m1"},))]
+    seen = {}
+    c.on("message", lambda m: seen.setdefault("m", m))
+    run(c.dispatch("MESSAGE_CREATE", {"id": "m1", "author": {"id": "u1"}}))
+    assert seen["m"].id == "m1"
 
 
 def test_wait_until_ready_with_timeout(monkeypatch):
@@ -280,7 +351,9 @@ def test_readme_example_end_to_end():
     from test_gateway import FakeWS, hello, ready
 
     ws = FakeWS([hello(), ready()])
-    bot = Client("tok", profile="web")
+    # FakeWS feeds plain dict frames, so this test pins json. The default is
+    # zlib-stream (covered by test_gateway_encoding_default_is_zlib_stream).
+    bot = Client("tok", profile="web", gateway_encoding="json")
     bot.http.session = Wire(ws)  # type: ignore[assignment]
 
     async def fake_boot():
@@ -289,7 +362,7 @@ def test_readme_example_end_to_end():
     bot.boot = fake_boot  # type: ignore[assignment]
 
     @bot.event
-    async def on_ready(data):
+    async def on_ready():
         pass
 
     async def main():
@@ -297,7 +370,7 @@ def test_readme_example_end_to_end():
         await asyncio.sleep(0.05)
         assert not task.done(), "run() returned while still connected"
         assert bot.user is not None and bot.user.id == "9"
-        assert "on_ready" in bot.gateway.listeners
+        assert "ready" in bot._listeners
         await bot.wait_until_ready(timeout=1)
         await bot.set_presence([{"name": "x", "type": 0}], force=True)
         assert any(p["op"] == 3 for p in ws.sent)
@@ -318,15 +391,15 @@ def test_proxy_and_timeout_are_reachable():
 
 
 # -- gateway encoding / session cache --------------------------------------
-def test_gateway_encoding_default_is_json():
+def test_gateway_encoding_default_is_zlib_stream():
     c = Client("tok")
-    assert c.gateway.encoding == "json"
+    assert c.gateway.encoding == "zlib-stream"
     run(c.http.close())
 
 
 def test_gateway_encoding_reaches_the_socket():
-    c = Client("tok", gateway_encoding="zlib-stream")
-    assert c.gateway.encoding == "zlib-stream"
+    c = Client("tok", gateway_encoding="json")
+    assert c.gateway.encoding == "json"
     run(c.http.close())
 
 
@@ -375,3 +448,41 @@ def test_two_clients_same_token_share_one_cache():
     assert a.session_cache is b.session_cache
     run(a.close())
     run(b.close())
+
+
+# -- READY seeds the cache (live payload shape) -------------------------------
+def test_ready_seeds_guilds_and_normalizes_int_ids(monkeypatch):
+    """Live READY embeds full guilds and uses integer snowflakes.
+
+    Without seeding, every get_guild after connect burns a REST call.
+    """
+    c, gw = patched(monkeypatch)
+    payload = {
+        "session_id": "sess-live",
+        "resume_gateway_url": "wss://gateway-us-east1-c.discord.gg",
+        "user": {"id": 975049360167563334, "username": "conorbx113678"},
+        "guilds": [
+            {
+                "id": 1550551193908936745,
+                "name": "fan club",
+                "owner_id": 975049360167563334,
+                "roles": [{"id": 1550551193908936745, "name": "@everyone"}],
+                "channels": [{"id": 1550551194672435203, "name": "general", "type": 0}],
+                "members": [
+                    {
+                        "nick": None,
+                        "roles": [],
+                        "user": {"id": 975049360167563334, "username": "conorbx113678"},
+                    }
+                ],
+            },
+            {"id": "999", "unavailable": True},
+        ],
+        "private_channels": [{"id": 915532208574455828, "type": 1}],
+    }
+    run(gw._emit("READY", payload))
+    guild = c.cache.get_guild("1550551193908936745")
+    assert guild is not None and guild.name == "fan club"
+    assert c.cache.get_channel("1550551194672435203") is not None
+    assert c.cache.get_channel("915532208574455828") is not None
+    assert c.cache.get_guild("999") is None

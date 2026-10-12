@@ -158,13 +158,12 @@ class FakeHttp(DespiseHttp):
         return {"url": "wss://gateway.discord.gg"}
 
 
-def make_gateway(*sockets, intents=0, encoding="json", session_cache=None):
+def make_gateway(*sockets, encoding="json", session_cache=None):
     """A gateway with zero backoff so reconnects are instantaneous."""
     http = FakeHttp(sockets)
     gw = Gateway(
         http,
         "tok",
-        intents=intents,
         max_backoff=0.0,
         encoding=encoding,
         session_cache=session_cache,
@@ -610,6 +609,20 @@ def test_first_identify_carries_no_presence():
 
     run(main())
     assert "presence" not in ws.sent[1]["d"]
+
+
+def test_identify_carries_no_intents():
+    """User accounts get every dispatch without intents; sending the field
+    is bot-like behavior that flags the account."""
+    ws = FakeWS([hello(), ready()])
+    gw = make_gateway(ws)
+
+    async def main():
+        await gw.connect()
+        await gw.close()
+
+    run(main())
+    assert "intents" not in ws.sent[1]["d"]
 
 
 def test_reidentify_replays_the_last_presence():

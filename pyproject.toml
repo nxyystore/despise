@@ -10,10 +10,6 @@ requires-python = ">=3.10"
 dependencies = ["curl-cffi>=0.7"]
 
 [project.optional-dependencies]
-# Per-token session cache (ROADMAP Tier 2). Optional until the code lands,
-# so a default install stays at one runtime dep.
-session-cache = ["cashews>=7.6"]
-session-cache-redis = ["cashews[redis]>=7.6"]
 test = ["pytest>=8"]
 dev = ["pytest>=8", "ruff>=0.6", "mypy>=1.11"]
 
