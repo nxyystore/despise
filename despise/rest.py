@@ -18,10 +18,12 @@ import asyncio
 import base64
 import json
 import logging
+import os
+from urllib.parse import quote
 
 from .gateway import PRESENCE_MIN_INTERVAL_S
 from .http import DespiseHttp
-from .models import Channel, Guild, Invite, Message, Relationship, User
+from .models import Channel, Guild, Invite, Member, Message, Relationship, Role, User
 
 log = logging.getLogger("despise.rest")
 
@@ -41,6 +43,7 @@ __all__ = [
     "ACTIVITY_TYPES",
     "PRESENCE_MIN_INTERVAL_S",
     "TYPING_REFRESH_S",
+    "File",
     "Rest",
     "TypingLoop",
     "build_activity",
@@ -148,17 +151,128 @@ def build_activity(
     return act
 
 
-class Rest:
-    """Borrowed-http REST helpers. Stateless; Client owns one."""
+class File:
+    """An attachment to upload with a message.
 
-    def __init__(self, http: DespiseHttp) -> None:
+    ``data`` holds bytes; ``local_path`` streams from disk instead. Prefer
+    :meth:`from_path` for files on disk::
+
+        from despise import File
+
+        await bot.send(cid, "look", files=[File.from_path("cat.png")])
+        await bot.send(cid, files=File(b"...", filename="blob.bin"))
+
+    A plain ``str``/``PathLike`` path, a ``bytes`` blob, a
+    ``(filename, data[, content_type])`` tuple, or a dict are all accepted
+    wherever a file is, and are normalised to ``File``.
+    """
+
+    __slots__ = ("filename", "data", "local_path", "content_type")
+
+    def __init__(
+        self,
+        data: bytes | None = None,
+        *,
+        filename: str | None = None,
+        local_path: str | None = None,
+        content_type: str = "application/octet-stream",
+    ) -> None:
+        if data is None and local_path is None:
+            raise ValueError("File needs data or a path")
+        if data is not None and local_path is not None:
+            raise ValueError("File takes data or a path, not both")
+        if filename is None:
+            filename = os.path.basename(local_path) if local_path else "file"
+        self.data = data
+        self.local_path = local_path
+        self.filename = filename
+        self.content_type = content_type
+
+    @classmethod
+    def from_path(
+        cls,
+        path: str | os.PathLike,
+        *,
+        filename: str | None = None,
+        content_type: str = "application/octet-stream",
+    ) -> File:
+        return cls(
+            None,
+            filename=filename or os.path.basename(str(path)),
+            local_path=str(path),
+            content_type=content_type,
+        )
+
+    def __repr__(self) -> str:  # pragma: no cover
+        return f"<File {self.filename}>"
+
+
+def _resolve_files(files) -> list[File]:
+    """Normalise whatever the caller passed into a list of ``File``."""
+    if files is None or files == []:
+        return []
+    if isinstance(files, File | bytes | tuple | dict | str | os.PathLike):
+        files = [files]
+    out: list[File] = []
+    for item in files:
+        if isinstance(item, File):
+            out.append(item)
+        elif isinstance(item, bytes):
+            out.append(File(item, filename="file.bin"))
+        elif isinstance(item, str | os.PathLike):
+            out.append(File.from_path(item))
+        elif isinstance(item, tuple):
+            name, data = item[0], item[1]
+            content_type = item[2] if len(item) > 2 else "application/octet-stream"
+            out.append(File(data, filename=name, content_type=content_type))
+        elif isinstance(item, dict):
+            out.append(File(**item))
+        else:
+            raise TypeError(f"cannot use {type(item).__name__} as a file")
+    return out
+
+
+def _emoji_param(emoji) -> str:
+    """Turn an emoji into the path segment a reaction route expects.
+
+    Accepts a :class:`~despise.models.Emoji`, a custom-emoji mention string
+    (``<:name:id>`` / ``<a:name:id>``), a ``name:id`` pair, or a unicode
+    emoji. The result is unquoted; callers quote it when building the URL.
+    """
+    from .models import Emoji
+
+    if isinstance(emoji, Emoji):
+        return f"{emoji.name}:{emoji._id}" if emoji._id else emoji.name
+    name = str(emoji)
+    if name.startswith("<") and name.endswith(">"):
+        parts = name.strip("<>").split(":")
+        if len(parts) == 3:  # a:name:id or :name:id
+            return f"{parts[1]}:{parts[2]}"
+    return name
+
+
+class Rest:
+    """Borrowed-http REST helpers. Stateless; Client owns one.
+
+    ``client`` is optional and only used to bind returned models back to a
+    Client, so ``msg.reply(...)`` works on anything this object hands out.
+    """
+
+    def __init__(self, http: DespiseHttp, *, client=None) -> None:
         self.http = http
+        self._client = client
+
+    def _bind(self, model):
+        """Attach the owning Client to a model, when there is one."""
+        if self._client is not None and model is not None:
+            model._bind(self._client)
+        return model
 
     # -- T0 -----------------------------------------------------------
     async def me(self) -> User:
         data = await self.http.request("GET", "/users/@me")
         assert isinstance(data, dict)
-        return User(data)
+        return self._bind(User(data))
 
     # -- T1 -----------------------------------------------------------
     async def open_dm(self, user_id: str) -> Channel:
@@ -166,48 +280,257 @@ class Rest:
             "POST", "/users/@me/channels", json_data={"recipient_id": user_id}
         )
         assert isinstance(data, dict)
-        return Channel(data)
+        return self._bind(Channel(data))
+
+    async def create_group_dm(
+        self, recipient_ids, *, nicks: dict | None = None
+    ) -> Channel:
+        """Create (or fetch) a group DM for 1+ other users.
+
+        ``recipient_ids`` are *user* ids. ``nicks`` maps user id -> the
+        nickname to show inside the group. A single recipient just opens a DM.
+        """
+        payload: dict = {"recipients": [str(uid) for uid in recipient_ids]}
+        if nicks:
+            payload["nicks"] = {str(k): v for k, v in nicks.items()}
+        data = await self.http.request(
+            "POST", "/users/@me/channels", json_data=payload
+        )
+        assert isinstance(data, dict)
+        return self._bind(Channel(data))
+
+    async def private_channels(self) -> list[Channel]:
+        """Every DM and group DM for the current user."""
+        data = await self.http.request("GET", "/users/@me/channels")
+        assert isinstance(data, list)
+        return [self._bind(Channel(c)) for c in data]
+
+    async def get_channel(self, channel_id: str) -> Channel:
+        data = await self.http.request("GET", f"/channels/{channel_id}")
+        assert isinstance(data, dict)
+        return self._bind(Channel(data))
+
+    async def edit_channel(
+        self, channel_id: str, *, reason: str | None = None, **fields
+    ) -> Channel:
+        """PATCH a channel. ``fields`` are Discord's modify-channel params.
+
+        ``name``, ``topic``, ``nsfw``, ``position``, ``rate_limit_per_user``,
+        ``parent_id``, ``bitrate``/``user_limit`` (voice), ``archived`` /
+        ``locked`` / ``auto_archive_duration`` (threads), ``flags``, ``type``...
+        pass them straight through to the API.
+        """
+        data = await self.http.request(
+            "PATCH", f"/channels/{channel_id}", json_data=fields, reason=reason
+        )
+        assert isinstance(data, dict)
+        return self._bind(Channel(data))
+
+    async def delete_channel(
+        self, channel_id: str, *, reason: str | None = None
+    ) -> None:
+        await self.http.request(
+            "DELETE", f"/channels/{channel_id}", reason=reason
+        )
+
+    async def edit_channel_permissions(
+        self,
+        channel_id: str,
+        overwrite_id: str,
+        *,
+        allow: str | int = "0",
+        deny: str | int = "0",
+        type: int = 0,
+        reason: str | None = None,
+    ) -> None:
+        """Create or replace a channel permission overwrite.
+
+        ``type`` is ``0`` for a role overwrite or ``1`` for a member one;
+        ``allow``/``deny`` are permission bitfields (ints are stringified).
+        """
+        await self.http.request(
+            "PUT",
+            f"/channels/{channel_id}/permissions/{overwrite_id}",
+            json_data={"type": type, "allow": str(allow), "deny": str(deny)},
+            reason=reason,
+        )
+
+    async def delete_channel_permission(
+        self, channel_id: str, overwrite_id: str, *, reason: str | None = None
+    ) -> None:
+        await self.http.request(
+            "DELETE",
+            f"/channels/{channel_id}/permissions/{overwrite_id}",
+            reason=reason,
+        )
+
+    async def add_recipient(self, channel_id: str, user_id: str):
+        """Add a user to a group DM.
+
+        Returns the resulting :class:`Channel` when Discord converts a DM into
+        a group DM, else ``None`` (204).
+        """
+        data = await self.http.request(
+            "PUT", f"/channels/{channel_id}/recipients/{user_id}"
+        )
+        return self._bind(Channel(data)) if isinstance(data, dict) else None
+
+    async def remove_recipient(self, channel_id: str, user_id: str) -> None:
+        await self.http.request(
+            "DELETE", f"/channels/{channel_id}/recipients/{user_id}"
+        )
+
+    async def guild_channels(self, guild_id: str) -> list[Channel]:
+        data = await self.http.request("GET", f"/guilds/{guild_id}/channels")
+        assert isinstance(data, list)
+        return [self._bind(Channel(c)) for c in data]
 
     async def send_message(
         self,
         channel_id: str,
-        content: str,
+        content: str | None = None,
         *,
         tts: bool = False,
         embeds: list | None = None,
+        components: list | None = None,
+        files=None,
+        poll: dict | None = None,
+        stickers: list | None = None,
         nonce: str | None = None,
         reply_to: str | None = None,
+        allowed_mentions: dict | None = None,
     ) -> Message:
-        payload: dict = {"content": content, "tts": tts}
+        """Send one message to a channel.
+
+        The single send path: text, embeds, component rows, a poll, stickers,
+        and file attachments all route through here. Files switch the request
+        to multipart automatically (Discord requires it) and every other field
+        rides along in ``payload_json``.
+        """
+        payload: dict = {"tts": tts}
+        if content is not None:
+            payload["content"] = content
         if embeds is not None:
             payload["embeds"] = embeds
+        if components is not None:
+            payload["components"] = components
+        if poll is not None:
+            payload["poll"] = poll
+        if stickers is not None:
+            payload["sticker_ids"] = [str(s) for s in stickers]
         if nonce is not None:
             payload["nonce"] = nonce
         if reply_to is not None:
-            payload["message_reference"] = {"message_id": reply_to}
-        data = await self.http.request(
-            "POST",
-            f"/channels/{channel_id}/messages",
-            json_data=payload,
-        )
+            payload["message_reference"] = {"message_id": str(reply_to)}
+        if allowed_mentions is not None:
+            payload["allowed_mentions"] = allowed_mentions
+
+        path = f"/channels/{channel_id}/messages"
+        resolved = _resolve_files(files)
+        if resolved:
+            payload["attachments"] = [
+                {"id": index, "filename": item.filename}
+                for index, item in enumerate(resolved)
+            ]
+            data = await self.http.upload(
+                path,
+                fields={"payload_json": json.dumps(payload)},
+                files=[
+                    {
+                        "field": f"files[{index}]",
+                        "filename": item.filename,
+                        "content_type": item.content_type,
+                        "data": item.data,
+                        "local_path": item.local_path,
+                    }
+                    for index, item in enumerate(resolved)
+                ],
+            )
+        else:
+            data = await self.http.request("POST", path, json_data=payload)
         assert isinstance(data, dict)
-        return Message(data)
+        return self._bind(Message(data))
 
     async def edit_message(
-        self, channel_id: str, message_id: str, content: str
+        self,
+        channel_id: str,
+        message_id: str,
+        content: str | None = None,
+        *,
+        embeds: list | None = None,
+        components: list | None = None,
+        allowed_mentions: dict | None = None,
     ) -> Message:
+        payload: dict = {}
+        if content is not None:
+            payload["content"] = content
+        if embeds is not None:
+            payload["embeds"] = embeds
+        if components is not None:
+            payload["components"] = components
+        if allowed_mentions is not None:
+            payload["allowed_mentions"] = allowed_mentions
         data = await self.http.request(
             "PATCH",
             f"/channels/{channel_id}/messages/{message_id}",
-            json_data={"content": content},
+            json_data=payload,
         )
         assert isinstance(data, dict)
-        return Message(data)
+        return self._bind(Message(data))
 
-    async def delete_message(self, channel_id: str, message_id: str) -> None:
-        await self.http.request(
-            "DELETE", f"/channels/{channel_id}/messages/{message_id}"
+    async def fetch_message(self, channel_id: str, message_id: str) -> Message:
+        data = await self.http.request(
+            "GET", f"/channels/{channel_id}/messages/{message_id}"
         )
+        assert isinstance(data, dict)
+        return self._bind(Message(data))
+
+    async def delete_message(
+        self, channel_id: str, message_id: str, *, reason: str | None = None
+    ) -> None:
+        await self.http.request(
+            "DELETE",
+            f"/channels/{channel_id}/messages/{message_id}",
+            reason=reason,
+        )
+
+    # -- reactions --------------------------------------------------------
+    async def add_reaction(
+        self, channel_id: str, message_id: str, emoji
+    ) -> None:
+        param = quote(_emoji_param(emoji), safe="")
+        await self.http.request(
+            "PUT",
+            f"/channels/{channel_id}/messages/{message_id}/reactions/{param}/@me",
+        )
+
+    async def remove_own_reaction(
+        self, channel_id: str, message_id: str, emoji
+    ) -> None:
+        param = quote(_emoji_param(emoji), safe="")
+        await self.http.request(
+            "DELETE",
+            f"/channels/{channel_id}/messages/{message_id}/reactions/{param}/@me",
+        )
+
+    async def remove_reaction(
+        self, channel_id: str, message_id: str, emoji, user_id: str
+    ) -> None:
+        param = quote(_emoji_param(emoji), safe="")
+        await self.http.request(
+            "DELETE",
+            f"/channels/{channel_id}/messages/{message_id}/reactions/"
+            f"{param}/{user_id}",
+        )
+
+    async def clear_reactions(
+        self, channel_id: str, message_id: str, *, emoji=None
+    ) -> None:
+        """Remove every reaction, or every reaction for one emoji."""
+        path = f"/channels/{channel_id}/messages/{message_id}/reactions"
+        if emoji is not None:
+            path += f"/{quote(_emoji_param(emoji), safe='')}"
+        await self.http.request("DELETE", path)
 
     async def typing(self, channel_id: str) -> None:
         await self.http.request("POST", f"/channels/{channel_id}/typing")
@@ -243,13 +566,117 @@ class Rest:
             "GET", f"/channels/{channel_id}/messages", params=params
         )
         assert isinstance(data, list)
-        return [Message(m) for m in data]
+        return [self._bind(Message(m)) for m in data]
+
+    async def pinned_messages(
+        self, channel_id: str, *, limit: int = 50, before=None
+    ) -> list[Message]:
+        """List a channel's pins (``GET .../messages/pins``)."""
+        params: list[tuple[str, str]] = [("limit", str(limit))]
+        if before is not None:
+            params.append(("before", str(before)))
+        data = await self.http.request(
+            "GET", f"/channels/{channel_id}/messages/pins", params=params
+        )
+        # The response wraps the pins in ``items`` (a list of messages).
+        items = data.get("items", data) if isinstance(data, dict) else data
+        assert isinstance(items, list)
+        return [self._bind(Message(m)) for m in items]
 
     async def pin(self, channel_id: str, message_id: str) -> None:
-        await self.http.request("PUT", f"/channels/{channel_id}/pins/{message_id}")
+        # Discord documents pins under ``/messages/pins``; the bare ``/pins``
+        # path this used to hit is not part of the API.
+        await self.http.request(
+            "PUT", f"/channels/{channel_id}/messages/pins/{message_id}"
+        )
 
     async def unpin(self, channel_id: str, message_id: str) -> None:
-        await self.http.request("DELETE", f"/channels/{channel_id}/pins/{message_id}")
+        await self.http.request(
+            "DELETE", f"/channels/{channel_id}/messages/pins/{message_id}"
+        )
+
+    async def crosspost_message(self, channel_id: str, message_id: str) -> Message:
+        """Publish a message from an announcement channel to followers."""
+        data = await self.http.request(
+            "POST",
+            f"/channels/{channel_id}/messages/{message_id}/crosspost",
+        )
+        assert isinstance(data, dict)
+        return self._bind(Message(data))
+
+    # -- read state ------------------------------------------------------
+    # Docs: https://docs.discord.food/topics/read-state
+    async def ack_message(
+        self,
+        channel_id: str,
+        message_id: str,
+        *,
+        token: str | None = None,
+        manual: bool | None = None,
+        mention_count: int | None = None,
+        flags: int | None = None,
+        last_viewed: int | None = None,
+    ) -> None:
+        """Mark a channel read up to ``message_id`` (fires Message Ack).
+
+        ``message_id`` only has to be a valid snowflake. When moving the
+        marker *backwards*, pass ``manual=True`` and the real
+        ``mention_count``, otherwise clients may ignore the update.
+        ``last_viewed`` is days since the Discord epoch.
+        """
+        payload: dict = {"token": token}
+        for key, value in (
+            ("manual", manual),
+            ("mention_count", mention_count),
+            ("flags", flags),
+            ("last_viewed", last_viewed),
+        ):
+            if value is not None:
+                payload[key] = value
+        await self.http.request(
+            "POST",
+            f"/channels/{channel_id}/messages/{message_id}/ack",
+            json_data=payload,
+        )
+
+    async def ack_pins(self, channel_id: str) -> None:
+        """Acknowledge the current pinned messages (fires Channel Pins Ack)."""
+        await self.http.request("POST", f"/channels/{channel_id}/pins/ack")
+
+    async def ack_guild(self, guild_id: str) -> None:
+        """Acknowledge every read state in a guild. Deprecated by Discord."""
+        await self.http.request("POST", f"/guilds/{guild_id}/ack")
+
+    async def ack_guild_feature(
+        self, guild_id: str, read_state_type: int, entity_id: str
+    ) -> None:
+        """Ack a guild feature read state (scheduled event, onboarding, ...)."""
+        await self.http.request(
+            "POST", f"/guilds/{guild_id}/ack/{read_state_type}/{entity_id}"
+        )
+
+    async def ack_user_feature(self, read_state_type: int, entity_id: str) -> None:
+        """Ack a user-level read state (guild home, message requests, ...)."""
+        await self.http.request(
+            "POST", f"/users/@me/{read_state_type}/{entity_id}/ack"
+        )
+
+    async def ack_bulk(self, read_states: list[dict]) -> None:
+        """Update many read states in one request.
+
+        Each entry is ``{"channel_id": ..., "message_id": ...}`` with an
+        optional ``read_state_type`` (default ``0``, CHANNEL). Unlike the
+        single ack, ``message_id`` must be greater than ``0``.
+        """
+        await self.http.request(
+            "POST", "/read-states/ack-bulk", json_data={"read_states": read_states}
+        )
+
+    async def delete_read_state(self, read_state_id: str) -> None:
+        """Delete a read state by its resource id (any read-state type)."""
+        await self.http.request(
+            "DELETE", f"/channels/{read_state_id}/messages/ack"
+        )
 
     # -- T2 -----------------------------------------------------------
     async def accept_invite(self, code: str) -> dict:
@@ -260,10 +687,193 @@ class Rest:
     async def get_guild(self, guild_id: str) -> Guild:
         data = await self.http.request("GET", f"/guilds/{guild_id}")
         assert isinstance(data, dict)
-        return Guild(data)
+        return self._bind(Guild(data))
 
     async def leave_guild(self, guild_id: str) -> None:
         await self.http.request("DELETE", f"/users/@me/guilds/{guild_id}")
+
+    async def guild_preview(self, guild_id: str) -> Guild:
+        """Partial guild object (works for discoverable guilds we are not in)."""
+        data = await self.http.request("GET", f"/guilds/{guild_id}/preview")
+        assert isinstance(data, dict)
+        return self._bind(Guild(data))
+
+    async def get_member(self, guild_id: str, user_id: str) -> Member:
+        data = await self.http.request(
+            "GET", f"/guilds/{guild_id}/members/{user_id}"
+        )
+        assert isinstance(data, dict)
+        # The member object carries no guild id of its own; stamp it so
+        # ``member.guild_id`` and ``client.get_member`` line up.
+        return self._bind(Member({**data, "guild_id": str(guild_id)}))
+
+    async def edit_member(
+        self,
+        guild_id: str,
+        user_id: str,
+        *,
+        nick: str | None = None,
+        roles: list[str] | None = None,
+        mute: bool | None = None,
+        deaf: bool | None = None,
+        channel_id: str | None = None,
+        communication_disabled_until: str | None = None,
+        reason: str | None = None,
+    ) -> Member:
+        """Modify a guild member (nick, roles, voice state, timeout)."""
+        payload: dict = {}
+        for key, value in (
+            ("nick", nick),
+            ("roles", [str(r) for r in roles] if roles is not None else None),
+            ("mute", mute),
+            ("deaf", deaf),
+            ("channel_id", channel_id),
+            ("communication_disabled_until", communication_disabled_until),
+        ):
+            if value is not None:
+                payload[key] = value
+        data = await self.http.request(
+            "PATCH",
+            f"/guilds/{guild_id}/members/{user_id}",
+            json_data=payload,
+            reason=reason,
+        )
+        assert isinstance(data, dict)
+        return self._bind(Member({**data, "guild_id": str(guild_id)}))
+
+    async def kick_member(
+        self, guild_id: str, user_id: str, *, reason: str | None = None
+    ) -> None:
+        await self.http.request(
+            "DELETE", f"/guilds/{guild_id}/members/{user_id}", reason=reason
+        )
+
+    async def add_member_role(
+        self,
+        guild_id: str,
+        user_id: str,
+        role_id: str,
+        *,
+        reason: str | None = None,
+    ) -> None:
+        await self.http.request(
+            "PUT",
+            f"/guilds/{guild_id}/members/{user_id}/roles/{role_id}",
+            reason=reason,
+        )
+
+    async def remove_member_role(
+        self,
+        guild_id: str,
+        user_id: str,
+        role_id: str,
+        *,
+        reason: str | None = None,
+    ) -> None:
+        await self.http.request(
+            "DELETE",
+            f"/guilds/{guild_id}/members/{user_id}/roles/{role_id}",
+            reason=reason,
+        )
+
+    async def bans(
+        self,
+        guild_id: str,
+        *,
+        limit: int = 1000,
+        before: str | None = None,
+        after: str | None = None,
+    ) -> list[dict]:
+        """List guild bans. User accounts must pass an explicit ``limit``."""
+        params: list[tuple[str, str]] = [("limit", str(limit))]
+        if before is not None:
+            params.append(("before", str(before)))
+        if after is not None:
+            params.append(("after", str(after)))
+        data = await self.http.request(
+            "GET", f"/guilds/{guild_id}/bans", params=params
+        )
+        assert isinstance(data, list)
+        return data
+
+    async def ban(
+        self,
+        guild_id: str,
+        user_id: str,
+        *,
+        delete_message_seconds: int = 0,
+        reason: str | None = None,
+    ) -> None:
+        await self.http.request(
+            "PUT",
+            f"/guilds/{guild_id}/bans/{user_id}",
+            json_data={"delete_message_seconds": delete_message_seconds},
+            reason=reason,
+        )
+
+    async def unban(
+        self, guild_id: str, user_id: str, *, reason: str | None = None
+    ) -> None:
+        await self.http.request(
+            "DELETE", f"/guilds/{guild_id}/bans/{user_id}", reason=reason
+        )
+
+    async def create_role(
+        self,
+        guild_id: str,
+        *,
+        name: str | None = None,
+        permissions: str | int | None = None,
+        color: int | None = None,
+        hoist: bool | None = None,
+        mentionable: bool | None = None,
+        unicode_emoji: str | None = None,
+        reason: str | None = None,
+        **fields,
+    ) -> Role:
+        """Create a role. ``permissions`` may be an int (stringified for you)."""
+        payload: dict = dict(fields)
+        for key, value in (
+            ("name", name),
+            ("permissions", str(permissions) if permissions is not None else None),
+            ("color", color),
+            ("hoist", hoist),
+            ("mentionable", mentionable),
+            ("unicode_emoji", unicode_emoji),
+        ):
+            if value is not None:
+                payload[key] = value
+        data = await self.http.request(
+            "POST", f"/guilds/{guild_id}/roles", json_data=payload, reason=reason
+        )
+        assert isinstance(data, dict)
+        return self._bind(Role(data))
+
+    async def edit_role(
+        self,
+        guild_id: str,
+        role_id: str,
+        *,
+        reason: str | None = None,
+        **fields,
+    ) -> Role:
+        """PATCH a role; ``fields`` are passed through (``name``, ``color``,
+        ``hoist``, ``mentionable``, ``permissions``, ``position``, ...)."""
+        data = await self.http.request(
+            "PATCH",
+            f"/guilds/{guild_id}/roles/{role_id}",
+            json_data=fields,
+            reason=reason,
+        )
+        assert isinstance(data, dict)
+        return self._bind(Role(data))
+
+    async def delete_role(
+        self, guild_id: str, role_id: str, *, reason: str | None = None
+    ) -> None:
+        await self.http.request(
+            "DELETE", f"/guilds/{guild_id}/roles/{role_id}", reason=reason
+        )
 
     async def subscribe_guild(
         self,
@@ -304,6 +914,50 @@ class Rest:
         )
         assert isinstance(data, dict)
         return Relationship(data)
+
+    # -- users -----------------------------------------------------------
+    async def get_user(self, user_id: str) -> User:
+        data = await self.http.request("GET", f"/users/{user_id}")
+        assert isinstance(data, dict)
+        return self._bind(User(data))
+
+    async def user_profile(
+        self,
+        user_id: str,
+        *,
+        guild_id: str | None = None,
+        with_mutual_guilds: bool | None = None,
+        with_mutual_friends: bool | None = None,
+    ) -> dict:
+        """Fetch a user profile (mutual guilds/friends, bio, connected accounts).
+
+        Requires a mutual guild, a friend relationship, or a ``guild_id`` we
+        share with them.
+        """
+        params: list[tuple[str, str]] = []
+        if guild_id is not None:
+            params.append(("guild_id", str(guild_id)))
+        if with_mutual_guilds is not None:
+            params.append(("with_mutual_guilds", str(with_mutual_guilds).lower()))
+        if with_mutual_friends is not None:
+            params.append(("with_mutual_friends", str(with_mutual_friends).lower()))
+        data = await self.http.request(
+            "GET", f"/users/{user_id}/profile", params=params or None
+        )
+        assert isinstance(data, dict)
+        return data
+
+    async def get_note(self, user_id: str) -> str:
+        """The current user's private note on a user (``""`` when unset)."""
+        data = await self.http.request("GET", f"/users/@me/notes/{user_id}")
+        assert isinstance(data, dict)
+        return data.get("note") or ""
+
+    async def set_note(self, user_id: str, note: str | None) -> None:
+        """Set (or clear, with ``None``) the private note on a user."""
+        await self.http.request(
+            "PUT", f"/users/@me/notes/{user_id}", json_data={"note": note}
+        )
 
     # -- T5: interactions ---------------------------------------------
     async def run_interaction(self, payload: dict) -> None:
@@ -356,7 +1010,7 @@ class Rest:
             json_data=payload,
         )
         assert isinstance(data, dict)
-        return Message(data)
+        return self._bind(Message(data))
 
     async def original_response(
         self, application_id: str, token: str, *, session_id: str | None = None
@@ -369,7 +1023,7 @@ class Rest:
             params=params,
         )
         assert isinstance(data, dict)
-        return Message(data)
+        return self._bind(Message(data))
 
     # -- T6: platform -------------------------------------------------
     async def get_invite(self, code: str) -> Invite:
@@ -387,7 +1041,7 @@ class Rest:
             params={"target_channel_id": target_channel_id},
         )
         assert isinstance(data, dict)
-        return Channel(data)
+        return self._bind(Channel(data))
 
     async def create_webhook(self, channel_id: str, name: str) -> dict:
         data = await self.http.request(
@@ -427,12 +1081,15 @@ class Rest:
         if not payload:
             raise ValueError("execute_webhook needs something to send")
         params = {"wait": "true"} if wait else None
-        return await self.http.request(
+        data = await self.http.request(
             "POST",
             f"/webhooks/{webhook_id}/{webhook_token}",
             json_data=payload,
             params=params,
         )
+        # ``wait=false`` yields an empty body; the declared contract is a dict
+        # or None, so normalise instead of leaking a ``list`` through.
+        return data if isinstance(data, dict) else None
 
     async def delete_webhook(self, webhook_id: str) -> None:
         await self.http.request("DELETE", f"/webhooks/{webhook_id}")
@@ -461,7 +1118,7 @@ class Rest:
         embeds: list | None = None,
         files: list | None = None,
     ) -> Message:
-        fields = {
+        fields: dict = {
             "content": content or "",
             "channel_id": newsletter_id,
         }

@@ -8,10 +8,15 @@ version = "1.0.0"
 description = "Minimal yet extensive selfbot library for discord."
 requires-python = ">=3.10"
 dependencies = ["curl-cffi>=0.7"]
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Typing :: Typed",
+]
 
 [project.optional-dependencies]
-test = ["pytest>=8"]
-dev = ["pytest>=8", "ruff>=0.6", "mypy>=1.11"]
+test = ["pytest>=8", "pytest-timeout>=2"]
+dev = ["pytest>=8", "pytest-timeout>=2", "ruff>=0.6", "mypy>=1.11"]
 
 [tool.setuptools.packages.find]
 include = ["despise*"]
@@ -22,6 +27,13 @@ despise = ["py.typed"]
 [tool.ruff]
 line-length = 88
 target-version = "py310"
+
+[tool.pytest.ini_options]
+# A hung gateway/HTTP test should fail, not wedge CI. Needs pytest-timeout
+# (in the test/dev extras); without it pytest only warns about the unknown
+# option, which is harmless.
+timeout = 60
+timeout_method = "thread"
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP", "B", "C4", "SIM"]
@@ -35,3 +47,5 @@ python_version = "3.10"
 warn_unused_ignores = true
 warn_redundant_casts = true
 ignore_missing_imports = true
+# The package ships ``py.typed``; this keeps the public surface honest.
+check_untyped_defs = true

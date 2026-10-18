@@ -1,7 +1,8 @@
 """Gateway lifecycle: Hello/Identify/READY/dispatch/resume/QoS.
 
 Borrows the ONE shared session from DespiseHttp (same impersonate/proxy).
-Single heartbeat task. zlib-stream encoding by default, plain json on request.
+Single heartbeat task. JSON encoding always; optional zlib-stream transport
+compression decoded through one shared inflator per connection.
 
 Lifecycle contract:
 - ``connect()`` performs the handshake, hands the socket to a *tracked*
@@ -43,6 +44,7 @@ from .exceptions import (
     GatewayTimeout,
     InvalidIntents,
     NotConnected,
+    TooManySessions,
     TooManySubscriptions,
 )
 from .headers import super_properties_dict
@@ -74,7 +76,7 @@ QOS = 40
 UPDATE_TIME_SPENT = 41
 
 # close codes that must NOT resume: fatal, or the session is unusable
-FATAL_CLOSE_CODES = {4004, 4010, 4011, 4012, 4013, 4014}
+FATAL_CLOSE_CODES = {4004, 4010, 4011, 4012, 4013, 4014, 4015}
 # bad seq / session timed out -> re-identify instead of resuming
 FRESH_CLOSE_CODES = {4007, 4009}
 # 4008 = identify throttled. Discord enforces a per-token cooldown, so a
@@ -89,10 +91,13 @@ BACKOFF_MAX_S = 60.0
 MAX_RECONNECT_ATTEMPTS = 10
 PRESENCE_MIN_INTERVAL_S = 5.0
 
-# "json" = plain text frames. "zlib-stream" compresses each message payload
-# with zlib and sends it as a binary frame: much less bandwidth on
-# guild-heavy accounts, at the cost of doing the codec ourselves.
+# Framing intent. The gateway's ``encoding`` query param is always json (the
+# docs allow only json/etf); "zlib-stream" here selects *transport
+# compression*, negotiated with a separate ``compress`` param and decoded
+# through one shared inflator per connection.
 GATEWAY_ENCODINGS = ("json", "zlib-stream")
+# Z_SYNC_FLUSH marker that ends each compressed message in the stream.
+ZLIB_SUFFIX = b"\x00\x00\xff\xff"
 
 
 class Gateway:
@@ -116,6 +121,10 @@ class Gateway:
         self.http = http
         self.token = token
         self.encoding = encoding
+        # zlib-stream is transport compression, not a wire encoding: outbound
+        # frames stay plain JSON and inbound frames share one inflator.
+        self._compressed = encoding == "zlib-stream"
+        self._reset_inflator()
         self.session_cache = session_cache
         self.listeners: dict[str, list] = dict(listeners or {})
         self.error_listeners: list = []
@@ -124,8 +133,9 @@ class Gateway:
         self.resume_url: str | None = None
         self.user: User | None = None
         self.max_backoff = max_backoff
-        # READY reports max_concurrency (how many guild subscriptions the
-        # account may hold). Exceeding it is close code 4013.
+        # READY reports max_concurrency: Discord's session-start limit (how
+        # many shards may identify at once, rate_limit_key = shard % n). It is
+        # *not* a guild-subscription cap and user accounts never get it.
         self.max_concurrency: int | None = None
         self.subscribed_guilds: set[str] = set()
         self._ws: Any = None
@@ -267,29 +277,47 @@ class Gateway:
             if not isinstance(data, dict):
                 raise GatewayClosed(f"unexpected /gateway payload: {data!r}")
             url = data["url"]
-        return f"{url}?v={GATEWAY_VERSION}&encoding={self.encoding}"
+        params = f"?v={GATEWAY_VERSION}&encoding=json"
+        if self._compressed:
+            params += "&compress=zlib-stream"
+        return f"{url}{params}"
 
     # -- framing ---------------------------------------------------------
-    # "json" is plain text frames. "zlib-stream" compresses each message
-    # payload with zlib and sends it as a binary frame, which is a large
-    # bandwidth win on guild-heavy accounts but means we do the codec
-    # ourselves instead of letting the websocket lib.
-    def _encode_payload(self, payload: dict) -> bytes:
-        return zlib.compress(json.dumps(payload, separators=(",", ":")).encode())
+    # Outbound frames are always plain-text JSON: the docs require events to
+    # be serialized as JSON or ETF, and transport compression only applies to
+    # what Discord sends. Inbound, zlib-stream is one continuous stream per
+    # connection -- push every frame into a buffer and only inflate once the
+    # ``00 00 ff ff`` Z_SYNC_FLUSH suffix arrives.
+    def _reset_inflator(self) -> None:
+        """Fresh shared zlib context. One per connection, per the docs."""
+        self._inflate = zlib.decompressobj()
+        self._inflate_buffer = bytearray()
 
     async def _send_frame(self, ws, payload: dict) -> None:
-        if self.encoding == "zlib-stream":
-            await ws.send_bytes(self._encode_payload(payload))
-        else:
-            await ws.send_json(payload)
+        await ws.send_json(payload)
 
     async def _recv_frame(self, ws):
-        if self.encoding == "zlib-stream":
-            raw, _frame_type = await ws.recv()
-            if isinstance(raw, str):
-                raw = raw.encode()
-            return json.loads(zlib.decompress(raw))
-        return await ws.recv_json()
+        """One inbound frame -> dict, or None if more chunks are pending."""
+        if not self._compressed:
+            return await ws.recv_json()
+        raw, _frame_type = await ws.recv()
+        if isinstance(raw, str):
+            raw = raw.encode()
+        self._inflate_buffer.extend(raw)
+        if len(self._inflate_buffer) < 4 or self._inflate_buffer[-4:] != ZLIB_SUFFIX:
+            return None
+        data = self._inflate.decompress(bytes(self._inflate_buffer))
+        self._inflate_buffer.clear()
+        if not data:
+            return None
+        return json.loads(data)
+
+    async def _recv_message(self, ws):
+        """Skip partial stream chunks and return the next complete message."""
+        while True:
+            msg = await self._recv_frame(ws)
+            if msg is not None:
+                return msg
 
     async def _restore_session(self) -> None:
         """Adopt a cached session so the next Identify can be a Resume."""
@@ -346,6 +374,7 @@ class Gateway:
         ws = await ctx.__aenter__()
         self._ws = ws
         self._ctx = ctx
+        self._reset_inflator()  # one zlib context per connection
         self._acked.set()
         self._ready.clear()
         if self._closed.is_set():
@@ -422,7 +451,7 @@ class Gateway:
 
     async def _recv_json(self, ws, timeout: float):
         try:
-            return await asyncio.wait_for(self._recv_frame(ws), timeout)
+            return await asyncio.wait_for(self._recv_message(ws), timeout)
         except asyncio.TimeoutError:
             raise GatewayTimeout(f"no frame within {timeout}s") from None
 
@@ -471,7 +500,7 @@ class Gateway:
                 ws = self._ws
                 if ws is None:
                     return
-                msg = await self._recv_frame(ws)
+                msg = await self._recv_message(ws)
                 op = msg.get("op")
 
                 if op == DISPATCH:
@@ -552,6 +581,8 @@ class Gateway:
                 err: BaseException = AuthenticationFailed(detail, code=code, reason=reason)
             elif code == 4014:
                 err = InvalidIntents(detail, code=code, reason=reason)
+            elif code == 4015:
+                err = TooManySessions(detail, code=code, reason=reason)
             else:
                 err = GatewayClosed(detail, code=code, reason=reason)
             return False, 0.0, err
@@ -646,10 +677,16 @@ class Gateway:
         await self._forget_session()
 
     async def _stop_tasks(self) -> None:
-        """Cancel background tasks."""
+        """Cancel background tasks.
+
+        ``_reconnect`` runs *from* the reader or heartbeat task, so the caller
+        is one of the tasks we are about to stop. Excluding it is mandatory:
+        cancelling and then awaiting the current task deadlocks the teardown,
+        leaving ``_closed`` unset and ``run()`` hung forever.
+        """
         current = asyncio.current_task()
         tracked = (self._beat_task, self._rotate_task, self._reader_task)
-        doomed = [t for t in tracked if t is not None]
+        doomed = [t for t in tracked if t is not None and t is not current]
         for task in doomed:
             if not task.done():
                 task.cancel()
@@ -669,6 +706,7 @@ class Gateway:
                 log.debug("socket close raised", exc_info=True)
         self._ws = None
         self._ctx = None
+        self._inflate_buffer.clear()
         self._ready.clear()
         self._acked.set()
         return code, reason
@@ -707,9 +745,11 @@ class Gateway:
     ) -> None:
         """op14 guild channel-subscribe.
 
-        Refuses to exceed READY's ``max_concurrency``: the server answers an
-        over-subscribed Identify/reconnect with close 4013, which costs a
-        reconnect. Catching it here is strictly cheaper.
+        Best-effort local cap from READY's ``max_concurrency``, when the field
+        is present (bot sessions). Discarding the subscription locally is
+        cheaper than letting Discord throttle the identify. Note the field is
+        really Discord's session-start limit, so treat the cap as advisory;
+        user accounts never receive it and are therefore unbounded here.
         """
         guild_id = str(guild_id)
         cap = self.max_concurrency
@@ -806,9 +846,20 @@ class Gateway:
                 log.debug("socket close raised", exc_info=True)
         self._ws = None
         self._ctx = None
+        self._reset_inflator()
         # A deliberate shutdown ends the session for good; leaving it cached
         # would make the next start resume a session Discord has retired.
         await self._discard_session()
+
+    async def terminate(self, error: BaseException) -> None:
+        """Stop permanently because of ``error`` -- no reconnect, no resume.
+
+        Used when the token is rejected (a REST 401). Unlike a transient
+        close there is nothing worth resuming, so the session is dropped and
+        ``wait_closed()`` raises ``error`` to whoever is awaiting it.
+        """
+        self._finish(error)
+        await self.close()
 
     async def wait_closed(self) -> None:
         """Block until the connection ends for good; raise if it was fatal."""

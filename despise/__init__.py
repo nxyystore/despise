@@ -5,6 +5,7 @@ curl_cffi-only, single shared HTTP session, restart-frozen profiles.
 
 from .cache import EntityCache
 from .client import Client
+from .cmd import CheckFailure, Context, Module, UsageError, command, listen, require
 from .exceptions import (
     AuthenticationFailed,
     AuthenticationHTTPError,
@@ -18,33 +19,44 @@ from .exceptions import (
     NotFound,
     RateLimited,
     ServerError,
+    TooManySessions,
     TooManySubscriptions,
 )
 from .gateway import GATEWAY_ENCODINGS
 from .headers import PROFILE_NAMES, BrowserProfile, ClientKind, build_profile
 from .interactions import (
+    autocomplete_response,
     build_action_row,
     build_button,
     build_modal,
     build_select,
     defer,
+    defer_thinking,
+    message_response,
+    modal_response,
+    pong,
+    update_response,
 )
 from .models import (
     Attachment,
     Channel,
     Embed,
+    EmbedField,
     Emoji,
     Guild,
     Invite,
     Member,
     Message,
+    MessageReference,
     Reaction,
+    ReactionEvent,
     Relationship,
     Role,
+    Sticker,
     User,
     VoiceState,
 )
-from .rest import TypingLoop, build_activity
+from .rest import File, TypingLoop, build_activity
 from .session_cache import SessionCache, SessionState
 from .tasks import Task
 from .tasks import loop as task_loop
@@ -56,6 +68,13 @@ __all__ = [
     "BrowserProfile",
     "build_profile",
     "Client",
+    "Module",
+    "CheckFailure",
+    "UsageError",
+    "command",
+    "require",
+    "listen",
+    "Context",
     "User",
     "Message",
     "Channel",
@@ -74,6 +93,7 @@ __all__ = [
     "GatewayTimeout",
     "NotConnected",
     "TooManySubscriptions",
+    "TooManySessions",
     "SessionCache",
     "SessionState",
     "GATEWAY_ENCODINGS",
@@ -84,11 +104,16 @@ __all__ = [
     "Attachment",
     "Embed",
     "Reaction",
+    "ReactionEvent",
     "Relationship",
     "Emoji",
     "Invite",
     "VoiceState",
+    "Sticker",
+    "EmbedField",
+    "MessageReference",
     "TypingLoop",
+    "File",
     "Task",
     "task_loop",
     "build_button",
@@ -96,5 +121,11 @@ __all__ = [
     "build_select",
     "build_modal",
     "defer",
+    "message_response",
+    "update_response",
+    "defer_thinking",
+    "modal_response",
+    "autocomplete_response",
+    "pong",
     "__version__",
 ]

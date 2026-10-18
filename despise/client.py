@@ -19,18 +19,16 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
-import random
-import time
 import uuid
 from collections.abc import Callable
 from typing import Any
 
 from .cache import EntityCache
-from .exceptions import DespiseError, Forbidden, NotFound
+from .exceptions import AuthenticationHTTPError, DespiseError, Forbidden, NotFound
 from .gateway import GATEWAY_ENCODINGS, Gateway
 from .headers import EphemeralIds, build_profile
 from .http import DespiseHttp
-from .models import Channel, User
+from .models import Channel, Model, User
 from .rest import Rest
 from .session_cache import SessionCache
 from .tasks import Task
@@ -62,6 +60,7 @@ class Client:
         session_cache: bool | str = False,
         version_resolver=None,
         cache_caps: tuple[int, int, int] | None = None,
+        command_prefix: str = "!",
     ) -> None:
         self.token = token
         self._preset = profile
@@ -83,7 +82,11 @@ class Client:
         if api_base is not None:
             http_kwargs["api_base"] = api_base
         self.http = DespiseHttp(self.profile, self.ephemeral, **http_kwargs)
-        self.rest = Rest(self.http)
+        self.rest = Rest(self.http, client=self)
+        # A rejected token stops the whole client; see _on_auth_dead.
+        self._auth_terminated = False
+        self._shutdown_task: asyncio.Task | None = None
+        self.http.on_auth_dead(self._on_auth_dead)
         if gateway_encoding not in GATEWAY_ENCODINGS:
             raise ValueError(
                 f"unknown gateway_encoding {gateway_encoding!r}, "
@@ -104,7 +107,16 @@ class Client:
             session_cache=self.session_cache,
         )
         self._booted = False
-        self.cache = EntityCache(*cache_caps) if cache_caps else EntityCache()
+        # EntityCache takes keyword-only caps; splatting the tuple raised
+        # ``TypeError`` for every caller that passed one.
+        if cache_caps:
+            self.cache = EntityCache(
+                guild_cap=cache_caps[0],
+                channel_cap=cache_caps[1],
+                user_cap=cache_caps[2],
+            )
+        else:
+            self.cache = EntityCache()
         self._listeners: dict[str, list] = {}
         self._raw_listeners: dict[str, list] = {}
         self._client_waiters: dict[str, list] = {}
@@ -118,25 +130,35 @@ class Client:
         self.tasks: list[Task] = []
         self.version_resolver = coerce_resolver(version_resolver)
         self._register_cache_listeners()
+        self.command_prefix = command_prefix
+        from .cmd import ModuleManager
+
+        self.modules = ModuleManager(self)
 
     # -- events ---------------------------------------------------------
     # Friendly discord.py-self style names on top of raw gateway dispatches.
     # ``bot.on("message", ...)`` and ``@bot.event async def on_message(m)``
     # receive a model. ``bot.on("MESSAGE_CREATE", ...)`` still receives the
-    # raw dict, exactly as before.
+    # raw dict, exactly as before. Dispatches with no friendly mapping
+    # (``MESSAGE_POLL_VOTE_ADD``, ``CALL_UPDATE``, ...) work too -- by their
+    # raw name or any spelling of it -- and deliver the raw payload.
     def on(self, event: str, coro=None):
-        from .events import RAW_TO_FRIENDLY, normalize, raw_for
+        from .events import route
 
-        upper = event.strip().upper().replace(" ", "_")
-        if upper in RAW_TO_FRIENDLY:
-            self._raw_listeners.setdefault(upper, []).append(coro)
-            self._ensure_bridge(upper)
-        else:
-            self._listeners.setdefault(normalize(event), []).append(coro)
-            raw = raw_for(event)
-            if raw is not None:
-                self._ensure_bridge(raw)
+        kind, key, raw = route(event)
+        if raw is not None:
+            self._ensure_bridge(raw)
+        bucket = self._raw_listeners if kind == "raw" else self._listeners
+        bucket.setdefault(key, []).append(coro)
         return coro
+
+    def _unhook(self, coro) -> None:
+        """Remove a listener from every bucket. Used to unload modules."""
+        for bucket in (self._listeners, self._raw_listeners):
+            for key in list(bucket):
+                bucket[key] = [c for c in bucket[key] if c is not coro]
+                if not bucket[key]:
+                    del bucket[key]
 
     def _ensure_bridge(self, raw: str) -> None:
         if raw in self._bridged:
@@ -154,6 +176,8 @@ class Client:
         if raw == "READY":
             self._seed_from_ready(payload)
         friendly, value = convert(raw, payload)
+        if isinstance(value, Model):
+            value._bind(self)
         targets: list[tuple] = []
         if friendly is not None and friendly not in NO_ARG_EVENTS:
             targets += [(c, value) for c in self._listeners.get(friendly, ())]
@@ -314,7 +338,7 @@ class Client:
         key = str(channel_id)
         cached = self.cache.get_channel(key)
         if cached is not None:
-            return cached
+            return cached._bind(self)
         try:
             data = await self.http.request("GET", f"/channels/{key}")
         except (NotFound, Forbidden):
@@ -325,13 +349,13 @@ class Client:
         assert isinstance(data, dict)
         channel = Channel(data)
         self.cache.put_channel(channel)
-        return channel
+        return channel._bind(self)
 
     async def get_user(self, user_id: str):
         key = str(user_id)
         cached = self.cache.get_user(key)
         if cached is not None:
-            return cached
+            return cached._bind(self)
         try:
             data = await self.http.request("GET", f"/users/{key}")
         except (NotFound, Forbidden):
@@ -342,7 +366,7 @@ class Client:
         assert isinstance(data, dict)
         user = User(data)
         self.cache.put_user(user)
-        return user
+        return user._bind(self)
 
     def get_member(self, user_id: str, guild_id: str):
         """Cache-only member lookup (no lazy fetch)."""
@@ -350,6 +374,38 @@ class Client:
 
     def clear_cache(self) -> None:
         self.cache.clear()
+
+    # -- sending --------------------------------------------------------
+    async def send(self, target, content: str | None = None, **kwargs):
+        """Send a message to a channel, a user, or a message.
+
+        A ``Message`` target replies in its own channel; a ``User`` target
+        opens a DM first; anything else is treated as a channel id. The
+        ``**kwargs`` are :meth:`~despise.rest.Rest.send_message`'s
+        (``files``, ``embeds``, ``components``, ``poll``, ``stickers``, ...).
+        """
+        from .models import Message
+
+        if isinstance(target, Message):
+            kwargs.setdefault("reply_to", target._id)
+            target = target.channel_id
+        return await self.rest.send_message(
+            await self._resolve_channel(target), content, **kwargs
+        )
+
+    async def reply(self, message, content: str | None = None, **kwargs):
+        """Reply to a ``Message`` (a readability alias for ``send``)."""
+        return await self.send(message, content, **kwargs)
+
+    async def _resolve_channel(self, target) -> str:
+        if isinstance(target, Channel):
+            return target._id
+        if isinstance(target, User):
+            return (await self.rest.open_dm(target._id))._id
+        return str(target)
+
+    async def fetch_message(self, channel_id, message_id):
+        return await self.rest.fetch_message(str(channel_id), str(message_id))
 
     # -- tasks ----------------------------------------------------------
     def add_task(self, task: Task) -> Task:
@@ -366,6 +422,25 @@ class Client:
         for task in list(self.tasks):
             task.cancel()
         self.tasks.clear()
+
+    def _on_auth_dead(self, exc: BaseException) -> None:
+        """A REST 401 means the token is dead -- stop the gateway, don't reconnect.
+
+        There is nothing worth persisting or resuming: cancel every task, tear
+        the socket down for good, and let whoever is awaiting ``run()`` see
+        ``exc``. Further authenticated requests fail fast without a network hit.
+        """
+        if self._auth_terminated:
+            return
+        self._auth_terminated = True
+        log.error("token rejected (401): stopping the gateway and all tasks")
+        self.cancel_tasks()
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:  # pragma: no cover - no loop, nothing to stop
+            self.gateway._finish(exc)
+            return
+        self._shutdown_task = loop.create_task(self.gateway.terminate(exc))
 
     def event(self, coro):
         """Decorator form: ``on_message`` registers for ``message``.
@@ -386,8 +461,23 @@ class Client:
 
         return decorator
 
-    def on_error(self, coro) -> None:
-        self.gateway.on_error(coro)
+    def on_error(self, coro, *, event: str | None = None):
+        """Register an ``async (event_name, exception)`` handler.
+
+        Global by default; pass ``event="command:ping"`` to only hear
+        about one command (or any other event name).
+        """
+        if event is None:
+            self.gateway.on_error(coro)
+            return
+
+        async def filtered(name: str, exc: BaseException) -> None:
+            if name == event:
+                res = coro(name, exc)
+                if inspect.isawaitable(res):
+                    await res
+
+        self.gateway.on_error(filtered)
 
     async def dispatch(self, event: str, payload=None) -> None:
         """Emit an event to client listeners, converting the payload.
@@ -395,28 +485,27 @@ class Client:
         Accepts friendly (``"message"``) or raw (``"MESSAGE_CREATE"``)
         names. Raw listeners receive the payload untouched.
         """
-        from .events import RAW_TO_FRIENDLY, normalize, raw_for
+        from .events import route
 
-        upper = event.strip().upper().replace(" ", "_")
-        raw = upper if upper in RAW_TO_FRIENDLY else raw_for(event)
+        _kind, key, raw = route(event)
         if raw is not None:
             # One path: gateway._emit reaches the cache listeners and the
             # bridge, which fans out to friendly/raw client listeners.
             self._ensure_bridge(raw)
             await self.gateway._emit(raw, payload)
-        else:
-            friendly = normalize(event)
-            await self.gateway._emit(event, payload)
-            for coro in list(self._listeners.get(friendly, ())):
-                try:
-                    res = coro() if payload is None else coro(payload)
-                    if inspect.isawaitable(res):
-                        await res
-                except asyncio.CancelledError:
-                    raise
-                except Exception as exc:
-                    await self._dispatch_error(friendly, exc)
-            await self._settle_client_waiters(friendly, friendly, payload, payload)
+            return
+        friendly = key
+        await self.gateway._emit(event, payload)
+        for coro in list(self._listeners.get(friendly, ())):
+            try:
+                res = coro() if payload is None else coro(payload)
+                if inspect.isawaitable(res):
+                    await res
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                await self._dispatch_error(friendly, exc)
+        await self._settle_client_waiters(friendly, friendly, payload, payload)
 
     async def wait_for(
         self,
@@ -430,11 +519,9 @@ class Client:
         The ``check`` sees what a listener sees: a model for friendly
         names (``m.author.id``), the raw dict for raw names.
         """
-        from .events import RAW_TO_FRIENDLY, normalize, raw_for
+        from .events import route
 
-        upper = event.strip().upper().replace(" ", "_")
-        key = upper if upper in RAW_TO_FRIENDLY else normalize(event)
-        raw = upper if upper in RAW_TO_FRIENDLY else raw_for(event)
+        _kind, key, raw = route(event)
         if raw is not None:
             self._ensure_bridge(raw)
         loop = asyncio.get_running_loop()
@@ -480,7 +567,7 @@ class Client:
         """Restart-only refresh: resolve versions, rebuild profile, set token."""
         if self._booted:
             return
-        
+
         # Retry logic for version resolution with exponential backoff
         for attempt in range(BOOT_MAX_RETRIES + 1):
             try:
@@ -500,6 +587,9 @@ class Client:
                 self.gateway.http = self.http
                 self._booted = True
                 return
+            except AuthenticationHTTPError:
+                # A rejected token is not worth retrying; fail immediately.
+                raise
             except (DespiseError, Forbidden, NotFound) as e:
                 if attempt == BOOT_MAX_RETRIES:
                     raise

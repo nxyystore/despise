@@ -20,6 +20,10 @@ from __future__ import annotations
 
 import re
 from datetime import datetime
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:  # pragma: no cover - typing only, avoids a runtime cycle
+    from .rest import TypingLoop
 
 # Discord timestamps: 2024-01-02T03:04:05.123456+00:00 / ...Z
 _TS_RE = re.compile(
@@ -59,13 +63,30 @@ def parse_timestamp(value: object) -> datetime | None:
 class Model:
     """Base for every entity. Subclasses declare their own ``__slots__``."""
 
-    __slots__ = ("_raw", "_id")
+    __slots__ = ("_raw", "_id", "_client")
 
     def __init__(self, data: dict | None) -> None:
         payload = data if isinstance(data, dict) else {}
         self._raw = payload
         raw_id = payload.get("id")
         self._id = str(raw_id) if raw_id is not None else ""
+        # Set by whatever Client/Rest handed the model out. Hand-built models
+        # stay unbound, and their action methods raise rather than guess.
+        self._client = None
+
+    def _bind(self, client):
+        """Attach a Client so action methods (``msg.reply``) work."""
+        self._client = client
+        return self
+
+    @property
+    def _bound_client(self):
+        if self._client is None:
+            raise RuntimeError(
+                f"{type(self).__name__} is not attached to a Client; use the "
+                "Client/Rest methods directly for hand-built models"
+            )
+        return self._client
 
     @property
     def id(self) -> str:
@@ -396,6 +417,50 @@ class Reaction(Model):
         return f"<Reaction {self.name} x{self.count}>"
 
 
+class ReactionEvent(Model):
+    """A ``MESSAGE_REACTION_ADD``/``REMOVE`` dispatch.
+
+    ``Reaction`` describes a reaction *on a message* (count/me/emoji); the
+    gateway event additionally has to say who reacted and where. The old
+    conversion threw all of that away and handed back a bare ``Reaction``,
+    so handlers could not tell which message or user the event was about.
+    Everything here comes straight from the payload.
+    """
+
+    __slots__ = (
+        "user_id",
+        "message_id",
+        "channel_id",
+        "guild_id",
+        "member",
+        "emoji",
+        "burst",
+        "type",
+    )
+
+    def __init__(self, data: dict | None) -> None:
+        super().__init__(data)
+        payload = self._raw
+        self.user_id = str(payload.get("user_id") or "")
+        self.message_id = str(payload.get("message_id") or "")
+        self.channel_id = str(payload.get("channel_id") or "")
+        self.guild_id = str(payload.get("guild_id") or "")
+        self.member = _nested(payload, "member", Member)
+        self.emoji = _nested(payload, "emoji", Emoji)
+        self.burst = bool(payload.get("burst", False))
+        self.type = payload.get("type")
+
+    @property
+    def emoji_name(self) -> str:
+        return self.emoji.name if self.emoji else ""
+
+    def __repr__(self) -> str:  # pragma: no cover
+        return (
+            f"<ReactionEvent {self.emoji_name} by {self.user_id} "
+            f"on {self.message_id}>"
+        )
+
+
 class MessageReference(Model):
     __slots__ = ("message_id", "channel_id", "guild_id", "fail_if_not_exists")
 
@@ -512,7 +577,11 @@ class Message(Model):
         payload = self._raw
         self.channel_id = str(payload.get("channel_id", ""))
         self.guild_id = str(payload.get("guild_id") or "")
-        self.author = _nested(payload, "author", User) or None
+        # Never ``None``: MESSAGE_DELETE (and system messages) arrive without
+        # an author, and ``msg.author.username`` is on the repr and on every
+        # ``clean_content``/mention path. An empty User keeps all of those
+        # working without a per-call None check.
+        self.author = _nested(payload, "author", User) or User(None)
         self.member = _nested(payload, "member", Member)
         self.content = payload.get("content", "") or ""
         self.timestamp = parse_timestamp(payload.get("timestamp"))
@@ -565,6 +634,73 @@ class Message(Model):
     @property
     def is_ephemeral(self) -> bool:
         return bool(self.flags & MESSAGE_FLAG_EPHEMERAL)
+
+    # -- actions ---------------------------------------------------------
+    async def reply(self, content: str | None = None, **kwargs) -> Message:
+        """Send a message in this channel, referencing this one.
+
+        Same ``**kwargs`` as :meth:`~despise.rest.Rest.send_message`
+        (``files``, ``embeds``, ``components``, ``poll``, ...).
+        """
+        kwargs.setdefault("reply_to", self._id)
+        return await self._bound_client.rest.send_message(
+            self.channel_id, content, **kwargs
+        )
+
+    async def edit(self, content: str | None = None, **kwargs) -> Message:
+        return await self._bound_client.rest.edit_message(
+            self.channel_id, self._id, content, **kwargs
+        )
+
+    async def delete(self, **kwargs) -> None:
+        await self._bound_client.rest.delete_message(
+            self.channel_id, self._id, **kwargs
+        )
+
+    async def fetch(self) -> Message:
+        """Re-fetch this message, so edits and reactions are current."""
+        return await self._bound_client.rest.fetch_message(
+            self.channel_id, self._id
+        )
+
+    async def react(self, emoji) -> None:
+        await self._bound_client.rest.add_reaction(
+            self.channel_id, self._id, emoji
+        )
+
+    async def remove_reaction(self, emoji, *, user_id: str | None = None) -> None:
+        """Remove a reaction. Defaults to your own; pass ``user_id`` for others."""
+        if user_id is None:
+            await self._bound_client.rest.remove_own_reaction(
+                self.channel_id, self._id, emoji
+            )
+        else:
+            await self._bound_client.rest.remove_reaction(
+                self.channel_id, self._id, emoji, user_id
+            )
+
+    async def clear_reactions(self, *, emoji=None) -> None:
+        await self._bound_client.rest.clear_reactions(
+            self.channel_id, self._id, emoji=emoji
+        )
+
+    async def pin(self) -> None:
+        await self._bound_client.rest.pin(self.channel_id, self._id)
+
+    async def unpin(self) -> None:
+        await self._bound_client.rest.unpin(self.channel_id, self._id)
+
+    async def crosspost(self) -> Message:
+        """Publish this message to the announcement channel's followers."""
+        return await self._bound_client.rest.crosspost_message(
+            self.channel_id, self._id
+        )
+
+    async def ack(self, **kwargs) -> None:
+        """Mark this channel read up to this message (:meth:`Rest.ack_message`)."""
+        await self._bound_client.rest.ack_message(
+            self.channel_id, self._id, **kwargs
+        )
 
     def __repr__(self) -> str:  # pragma: no cover
         return f"<Message {self._id} by {self.author.username}>"
@@ -657,6 +793,31 @@ class Channel(Model):
     def mention(self) -> str:
         return f"#{self.name}" if not self.is_dm else self.name
 
+    # -- actions ---------------------------------------------------------
+    async def send(self, content: str | None = None, **kwargs) -> Message:
+        return await self._bound_client.rest.send_message(
+            self._id, content, **kwargs
+        )
+
+    async def fetch_message(self, message_id: str) -> Message:
+        return await self._bound_client.rest.fetch_message(self._id, message_id)
+
+    async def history(self, **kwargs) -> list[Message]:
+        return await self._bound_client.rest.history(self._id, **kwargs)
+
+    async def typing(self) -> None:
+        await self._bound_client.rest.typing(self._id)
+
+    async def ack(self, message_id: str, **kwargs) -> None:
+        """Mark this channel read up to ``message_id``."""
+        await self._bound_client.rest.ack_message(self._id, message_id, **kwargs)
+
+    async def pins(self, **kwargs) -> list[Message]:
+        return await self._bound_client.rest.pinned_messages(self._id, **kwargs)
+
+    def typing_loop(self, **kwargs) -> TypingLoop:
+        return self._bound_client.rest.typing_loop(self._id, **kwargs)
+
     def __repr__(self) -> str:  # pragma: no cover
         return f"<Channel {self._id} type={self.type}>"
 
@@ -696,7 +857,9 @@ class Guild(Model):
         self.members = _child_list(payload, "members", Member)
         self.roles = _child_list(payload, "roles", Role)
         self.emojis = _child_list(payload, "emojis", Emoji)
-        self.stickers = _child_list(payload, "sticker_items", Sticker)
+        # Guild sends ``stickers``; only a *message* nests them under
+        # ``sticker_items``. Reading the message key here always yielded [].
+        self.stickers = _child_list(payload, "stickers", Sticker)
         features = payload.get("features")
         self.features = features if isinstance(features, list) else []
         self.description = payload.get("description")
@@ -794,6 +957,7 @@ __all__ = [
     "Embed",
     "EmbedField",
     "Reaction",
+    "ReactionEvent",
     "MessageReference",
     "Message",
     "Channel",

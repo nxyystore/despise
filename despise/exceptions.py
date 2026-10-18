@@ -59,11 +59,22 @@ class InvalidIntents(GatewayClosed):
     """Close code 4014 -- the supplied ``intents`` are unacceptable."""
 
 
+class TooManySessions(GatewayClosed):
+    """Close code 4015 -- too many gateway sessions for this user account.
+
+    Discord caps concurrent user-account sessions; a second process holding
+    the same token, or a socket leaked by a crash, earns this close. It is
+    fatal for the library (re-identifying just re-trips it) -- close the
+    other session first.
+    """
+
+
 class TooManySubscriptions(DespiseError):
     """Refused a guild subscription because READY's ``max_concurrency`` is hit.
 
-    The server answers an over-subscribed client with close code 4013, which
-    costs a reconnect, so this is caught locally instead.
+    ``max_concurrency`` is Discord's session-start limit; this guard is
+    advisory and only fires when the field is present. (Close code ``4013``
+    is *invalid intents*, not an over-subscription signal.)
     """
 
     def __init__(

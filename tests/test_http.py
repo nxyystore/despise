@@ -171,6 +171,39 @@ def test_401_raises_authentication_error():
     run(http.close())
 
 
+def test_401_with_a_token_trips_the_breaker():
+    http, _ = make_http([FakeResp(401, "401: Unauthorized")])
+    http.set_token("tok")
+    seen = []
+    http.on_auth_dead(seen.append)
+    with pytest.raises(AuthenticationHTTPError):
+        run(http.request("GET", "/users/@me"))
+    assert http.auth_dead is True
+    assert len(seen) == 1 and isinstance(seen[0], AuthenticationHTTPError)
+    run(http.close())
+
+
+def test_tripped_breaker_fails_fast_with_no_network_call():
+    http, fake = make_http([FakeResp(401, "401: Unauthorized")])
+    http.set_token("tok")
+    with pytest.raises(AuthenticationHTTPError):
+        run(http.request("GET", "/users/@me"))
+    calls = len(fake.calls)
+    with pytest.raises(AuthenticationHTTPError):
+        run(http.request("GET", "/users/@me"))
+    # the dead token is never sent again
+    assert len(fake.calls) == calls
+    run(http.close())
+
+
+def test_unauthenticated_401_does_not_trip_the_breaker():
+    http, _ = make_http([FakeResp(401, "401: Unauthorized")])
+    with pytest.raises(AuthenticationHTTPError):
+        run(http.request("GET", "/gateway", auth=False))
+    assert http.auth_dead is False
+    run(http.close())
+
+
 def test_403_raises_forbidden_with_discord_code():
     body = json.dumps({"message": "Missing Permissions", "code": 50013})
     http, _ = make_http([FakeResp(403, body)])
@@ -491,5 +524,27 @@ def test_upload_sends_a_multipart_body():
 def test_upload_supports_only_fields():
     http, fake = make_http([FakeResp(200, "{}")])
     run(http.upload("/guilds/1/emojis", fields={"name": "blob"}))
+    assert fake.calls[0][2]["multipart"] is not None
+    run(http.close())
+
+
+def test_upload_accepts_a_list_of_files():
+    http, fake = make_http([FakeResp(200, '{"id":"1"}')])
+    out = run(
+        http.upload(
+            "/channels/c1/messages",
+            fields={"payload_json": "{}"},
+            files=[
+                {
+                    "field": "files[0]",
+                    "filename": "a.png",
+                    "content_type": "image/png",
+                    "data": b"x",
+                },
+                {"field": "files[1]", "filename": "b.txt", "data": b"y"},
+            ],
+        )
+    )
+    assert out == {"id": "1"}
     assert fake.calls[0][2]["multipart"] is not None
     run(http.close())

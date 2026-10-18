@@ -17,6 +17,7 @@ from despise.models import (
     Member,
     Message,
     Reaction,
+    ReactionEvent,
     Relationship,
     Role,
     User,
@@ -173,6 +174,30 @@ def test_message_flag_helpers():
     assert Message({}).suppressed_embeds is False
 
 
+def test_reaction_event_keeps_context_and_survives_a_minimal_payload():
+    ev = ReactionEvent(
+        {
+            "user_id": "u1",
+            "message_id": "m1",
+            "channel_id": "c1",
+            "guild_id": "g1",
+            "member": {"user": {"id": "u1", "username": "a"}},
+            "emoji": {"id": "e1", "name": "ok"},
+            "burst": True,
+        }
+    )
+    assert (ev.user_id, ev.message_id) == ("u1", "m1")
+    assert (ev.channel_id, ev.guild_id) == ("c1", "g1")
+    assert ev.emoji_name == "ok"
+    assert ev.member is not None and ev.member.id == "u1"
+    assert ev.burst is True
+
+    empty = ReactionEvent(None)
+    assert empty.user_id == "" and empty.message_id == ""
+    assert empty.member is None and empty.emoji is None
+    assert empty.emoji_name == "" and empty.burst is False
+
+
 def test_message_defaults_are_safe():
     m = Message({"id": "m"})
     # an absent author yields an empty User rather than an exception
@@ -240,6 +265,7 @@ def test_guild_extras():
             "members": [{"user": {"id": "u1"}}],
             "roles": [{"id": "r1", "name": "role"}],
             "emojis": [{"id": "e1", "name": "blob"}],
+            "stickers": [{"id": "s1", "name": "wave"}],
         }
     )
     assert isinstance(g.channels[0], Channel)
@@ -247,6 +273,9 @@ def test_guild_extras():
     assert isinstance(g.roles[0], Role)
     assert g.features == ["COMMUNITY"]
     assert g.members[0].user.id == "u1"
+    # guild stickers live under ``stickers``, not the message-only
+    # ``sticker_items`` key -- reading the wrong one always returned [].
+    assert [s.id for s in g.stickers] == ["s1"]
 
 
 def test_guild_features_tolerates_a_string():

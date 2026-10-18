@@ -7,6 +7,7 @@ shows up here as a second consumer of the same frames.
 
 import asyncio
 import json
+import zlib
 
 import pytest
 
@@ -16,6 +17,7 @@ from despise.exceptions import (
     GatewayClosed,
     GatewayTimeout,
     NotConnected,
+    TooManySessions,
     TooManySubscriptions,
 )
 from despise.gateway import (
@@ -341,6 +343,27 @@ def test_wait_for_timeout_cleans_up():
 
 
 # -- close-code policy ------------------------------------------------------
+def test_stop_tasks_spares_the_current_task():
+    """Regression: _stop_tasks used to cancel the task that called it.
+
+    _reconnect runs from the reader/heartbeat task, so cancelling then
+    awaiting the caller deadlocked teardown -- _closed was never set and
+    run() hung forever on every reader-triggered reconnect.
+    """
+    gw = make_gateway(FakeWS())
+
+    async def main():
+        current = asyncio.current_task()
+        # Both slots point at the caller, simulating a reader/heartbeat stop.
+        gw._reader_task = current
+        gw._beat_task = current
+        await gw._stop_tasks()  # must not cancel or await the caller
+        assert asyncio.current_task() is current
+        assert gw._reader_task is None and gw._beat_task is None
+
+    run(main())
+
+
 def test_fatal_close_code_stops_and_raises():
     ws = FakeWS([hello(), ready()])
     gw = make_gateway(ws)
@@ -366,6 +389,39 @@ def test_fatal_intents_code_raises_invalid_intents():
 
     with pytest.raises(GatewayClosed, match="4014"):
         run(main())
+
+
+def test_too_many_sessions_is_fatal():
+    """4015 = too many user-account sessions. Reconnecting just re-trips it,
+    so it must stop the gateway with a typed error rather than loop."""
+    ws = FakeWS([hello(), ready()])
+    gw = make_gateway(ws)
+
+    async def main():
+        await gw.connect()
+        ws.drop(code=4015, reason="Too many sessions")
+        await gw.wait_closed()
+
+    with pytest.raises(TooManySessions) as excinfo:
+        run(main())
+    assert excinfo.value.code == 4015
+    assert gw.closed is True
+
+
+def test_terminate_stops_for_good_and_raises():
+    ws = FakeWS([hello(), ready()])
+    gw = make_gateway(ws)
+    err = AuthenticationFailed("token revoked", code=4004)
+
+    async def main():
+        await gw.connect()
+        await gw.terminate(err)
+        await gw.wait_closed()
+
+    with pytest.raises(AuthenticationFailed):
+        run(main())
+    assert gw.closed is True
+    assert gw._reader_task is None and gw._beat_task is None
 
 
 def test_fresh_close_code_reidentifies():
@@ -815,12 +871,28 @@ def test_lazy_load_failure_is_dispatched():
 
 
 # -- zlib-stream framing ----------------------------------------------------
-def zframe(obj) -> bytes:
-    """Under encoding=zlib-stream the server compresses *every* frame, HELLO
-    included -- so the fixtures must be pre-compressed."""
-    import zlib
+# Transport compression is one continuous zlib stream per connection: the
+# server reuses a single compressor and flushes a `00 00 ff ff` Z_SYNC_FLUSH
+# suffix at the end of each message, HELLO included. Model that faithfully --
+# a fresh zlib context per fixture would hide exactly the bug we're guarding.
+ZLIB_SUFFIX = b"\x00\x00\xff\xff"
 
-    return zlib.compress(json.dumps(obj).encode())
+
+class ZlibServer:
+    """Server-side zlib-stream encoder: one shared context per connection."""
+
+    def __init__(self):
+        self._compressor = zlib.compressobj()
+
+    def frame(self, obj, *, chunks=1):
+        """Encode one message; optionally split it across socket frames."""
+        data = self._compressor.compress(json.dumps(obj).encode())
+        data += self._compressor.flush(zlib.Z_SYNC_FLUSH)
+        assert data.endswith(ZLIB_SUFFIX)
+        if chunks <= 1:
+            return [data]
+        step = max(1, len(data) // chunks)
+        return [data[i : i + step] for i in range(0, len(data), step)]
 
 
 def test_ws_url_reflects_the_encoding():
@@ -835,8 +907,9 @@ def test_ws_url_reflects_the_encoding():
     assert gw.http.session.urls == ["wss://gateway.discord.gg?v=9&encoding=json"]
 
 
-def test_zlib_stream_url():
-    ws = FakeWS([zframe(hello()), zframe(ready())])
+def test_zlib_stream_url_uses_the_compress_param():
+    srv = ZlibServer()
+    ws = FakeWS(srv.frame(hello()) + srv.frame(ready()))
     gw = make_gateway(ws, encoding="zlib-stream")
 
     async def main():
@@ -844,15 +917,15 @@ def test_zlib_stream_url():
         await gw.close()
 
     run(main())
+    # encoding stays json; compression is a separate param (docs: /gateway/using-gateway#connecting)
     assert gw.http.session.urls == [
-        "wss://gateway.discord.gg?v=9&encoding=zlib-stream"
+        "wss://gateway.discord.gg?v=9&encoding=json&compress=zlib-stream"
     ]
 
 
 def test_zlib_stream_roundtrip():
-    import zlib
-
-    ws = FakeWS([zframe(hello()), zframe(ready())])
+    srv = ZlibServer()
+    ws = FakeWS(srv.frame(hello()) + srv.frame(ready()))
     gw = make_gateway(ws, encoding="zlib-stream")
     got = []
 
@@ -860,18 +933,36 @@ def test_zlib_stream_roundtrip():
         await gw.connect()
         await gw.subscribe_guild("g1")
         assert gw.subscribed_guilds == {"g1"}
-        ws.feed(zframe(create(d={"id": "z1"})))
+        ws.feed(*srv.frame(create(d={"id": "z1"})))
         await wait_until(lambda: got)
         await gw.close()
 
     gw.on("MESSAGE_CREATE", got.append)
     run(main())
-    assert ws.sent == []  # nothing went out as plain JSON
-    assert ws.sent_bytes, "expected zlib-compressed frames"
-    decoded = json.loads(zlib.decompress(ws.sent_bytes[1]))
-    assert decoded["op"] == IDENTIFY
-    assert decoded["d"]["token"] == "tok"
-    assert json.loads(zlib.decompress(ws.sent_bytes[-1]))["op"] == 14
+    assert [m["id"] for m in got] == ["z1"]
+    # Outbound frames stay plain-text JSON -- transport compression is inbound only.
+    assert ws.sent_bytes == [], "outbound frames must not be compressed"
+    assert ws.sent[1]["op"] == IDENTIFY
+    assert ws.sent[1]["d"]["token"] == "tok"
+    assert ws.sent[-1]["op"] == 14
+
+
+def test_zlib_stream_buffers_split_chunks():
+    """A message split across socket frames must not be parsed mid-stream."""
+    srv = ZlibServer()
+    ws = FakeWS(srv.frame(hello()) + srv.frame(ready()))
+    gw = make_gateway(ws, encoding="zlib-stream")
+    got = []
+
+    async def main():
+        await gw.connect()
+        ws.feed(*srv.frame(create(d={"id": "split"}), chunks=5))
+        await wait_until(lambda: got)
+        await gw.close()
+
+    gw.on("MESSAGE_CREATE", got.append)
+    run(main())
+    assert [m["id"] for m in got] == ["split"]
 
 
 def test_unknown_encoding_rejected():

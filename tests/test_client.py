@@ -6,7 +6,7 @@ import inspect
 import pytest
 
 from despise.client import Client
-from despise.exceptions import AuthenticationFailed
+from despise.exceptions import AuthenticationFailed, AuthenticationHTTPError
 
 
 class FakeGateway:
@@ -35,6 +35,11 @@ class FakeGateway:
         """Simulate a fatal close code: wait_closed() raises, like the real one."""
         self._fatal = exc
         self.closed_event.set()
+
+    async def terminate(self, exc):
+        """Mirror Gateway.terminate: record the fatal cause, then stop."""
+        self.fail(exc)
+        await self.close()
 
     async def _emit(self, event, *args):
         # Faithful: the real Gateway runs listeners here.
@@ -146,6 +151,53 @@ def test_run_surfaces_fatal_close_error(monkeypatch):
 
     with pytest.raises(AuthenticationFailed):
         run(c.run())
+
+
+# -- 401 stops everything ---------------------------------------------------
+def test_auth_failure_stops_the_gateway(monkeypatch):
+    c, gw = patched(monkeypatch)
+    exc = AuthenticationHTTPError("401: Unauthorized", status=401)
+
+    async def scenario():
+        c.http.trip_auth(exc)
+        assert c._shutdown_task is not None, "a 401 must schedule a shutdown"
+        await c._shutdown_task
+        assert gw.closed is True
+        # run()/wait_closed() now surfaces the reason to the caller
+        with pytest.raises(AuthenticationHTTPError):
+            await c.gateway.wait_closed()
+
+    run(scenario())
+
+
+def test_auth_failure_is_terminal(monkeypatch):
+    c, gw = patched(monkeypatch)
+    exc = AuthenticationHTTPError("401: Unauthorized", status=401)
+
+    async def scenario():
+        c.http.trip_auth(exc)
+        await c._shutdown_task
+        # A second signal must not spawn another shutdown.
+        c.http.trip_auth(AuthenticationHTTPError("again", status=401))
+        assert c._auth_terminated is True
+
+    run(scenario())
+
+
+def test_boot_does_not_retry_a_rejected_token(monkeypatch):
+    from despise.versions import VersionResolver
+
+    c = Client("tok")
+    calls = []
+
+    def boom(self, session):
+        calls.append(1)
+        raise AuthenticationHTTPError("401: Unauthorized", status=401)
+
+    monkeypatch.setattr(VersionResolver, "resolve", boom)
+    with pytest.raises(AuthenticationHTTPError):
+        run(c.boot())
+    assert len(calls) == 1, "a 401 must not be retried"
 
 
 def test_close_closes_both_halves(monkeypatch):
@@ -275,6 +327,134 @@ def test_dispatch_routes_through_emit(monkeypatch):
     assert seen["m"].id == "m1"
 
 
+# -- unmapped dispatches ----------------------------------------------------
+# Regression: a dispatch with no friendly mapping used to register a listener
+# in a bucket nothing ever filled, so it silently never fired.
+def test_unmapped_dispatch_fires_for_its_raw_name(monkeypatch):
+    c, gw = patched(monkeypatch)
+    seen = []
+    c.on("GUILD_BAN_ADD", seen.append)
+    payload = {"guild_id": "g1", "user": {"id": "u1"}}
+    run(gw._emit("GUILD_BAN_ADD", payload))
+    assert seen == [payload]
+
+
+def test_unmapped_dispatch_fires_for_a_lowercase_spelling(monkeypatch):
+    c, gw = patched(monkeypatch)
+    seen = []
+    c.on("guild_ban_add", seen.append)
+    run(gw._emit("GUILD_BAN_ADD", {"guild_id": "g1"}))
+    assert seen == [{"guild_id": "g1"}]
+
+
+def test_event_decorator_reaches_an_unmapped_dispatch(monkeypatch):
+    c, gw = patched(monkeypatch)
+    seen = []
+
+    @c.event
+    async def on_message_poll_vote_add(payload):
+        seen.append(payload)
+
+    run(gw._emit("MESSAGE_POLL_VOTE_ADD", {"message_id": "m1"}))
+    assert seen == [{"message_id": "m1"}]
+
+
+def test_wait_for_an_unmapped_dispatch(monkeypatch):
+    c, gw = patched(monkeypatch)
+
+    async def main():
+        waiter = asyncio.ensure_future(c.wait_for("THREAD_CREATE", timeout=1))
+        await asyncio.sleep(0)  # let the waiter register
+        await gw._emit("THREAD_CREATE", {"id": "t1"})
+        return await waiter
+
+    assert run(main())["id"] == "t1"
+
+
+def test_short_alias_reaches_the_canonical_bucket(monkeypatch):
+    # "msg" must land in the same bucket "message" does, or nothing fills it.
+    c, gw = patched(monkeypatch)
+    seen = []
+    c.on("msg", seen.append)
+    run(gw._emit("MESSAGE_CREATE", {"id": "m1", "author": {"id": "u1"}}))
+    assert seen and seen[0].id == "m1"
+
+
+def test_reaction_listener_receives_a_reaction_event(monkeypatch):
+    from despise.models import ReactionEvent
+
+    c, gw = patched(monkeypatch)
+    seen = []
+    c.on("reaction_add", seen.append)
+    run(
+        gw._emit(
+            "MESSAGE_REACTION_ADD",
+            {
+                "user_id": "u1",
+                "message_id": "m1",
+                "channel_id": "c1",
+                "emoji": {"name": "ok"},
+            },
+        )
+    )
+    assert isinstance(seen[0], ReactionEvent)
+    assert seen[0].message_id == "m1" and seen[0].user_id == "u1"
+
+
+def test_dispatched_models_are_bound_to_the_client(monkeypatch):
+    c, gw = patched(monkeypatch)
+    seen = []
+    c.on("message", seen.append)
+    run(
+        gw._emit(
+            "MESSAGE_CREATE",
+            {"id": "m1", "channel_id": "c1", "author": {"id": "u1"}},
+        )
+    )
+    assert seen[0]._client is c, "a dispatched Message must know its client"
+
+
+# -- unified send -----------------------------------------------------------
+class RecordingRest:
+    def __init__(self):
+        self.calls = []
+
+    async def send_message(self, channel_id, content=None, **kwargs):
+        self.calls.append((channel_id, content, kwargs))
+        return f"sent:{channel_id}"
+
+    async def open_dm(self, user_id):
+        from despise.models import Channel
+
+        self.calls.append(("open_dm", user_id))
+        return Channel({"id": "dm1", "type": 1})
+
+    async def fetch_message(self, channel_id, message_id):
+        self.calls.append(("fetch", channel_id, message_id))
+        return (channel_id, message_id)
+
+
+def test_send_resolves_channel_user_and_message_targets(monkeypatch):
+    from despise.models import Channel, Message, User
+
+    c, _ = patched(monkeypatch)
+    rec = RecordingRest()
+    c.rest = rec  # type: ignore[assignment]
+
+    assert run(c.send("c1", "hi")) == "sent:c1"
+    assert run(c.send(Channel({"id": "c2"}), "yo")) == "sent:c2"
+    assert run(c.send(User({"id": "u1"}), "dm")) == "sent:dm1"
+    assert run(c.send(Message({"id": "m1", "channel_id": "c3"}), "re")) == "sent:c3"
+
+    assert ("open_dm", "u1") in rec.calls
+    # a Message target becomes a reply, keeping the message's channel
+    assert rec.calls[-1] == ("c3", "re", {"reply_to": "m1"})
+
+    assert run(c.reply(Message({"id": "m9", "channel_id": "c9"}), "x")) == "sent:c9"
+    assert rec.calls[-1] == ("c9", "x", {"reply_to": "m9"})
+    assert run(c.fetch_message("c1", "m7")) == ("c1", "m7")
+
+
 def test_wait_until_ready_with_timeout(monkeypatch):
     c, gw = patched(monkeypatch)
 
@@ -382,6 +562,41 @@ def test_readme_example_end_to_end():
     assert bot.http.session.urls == ["wss://gateway.discord.gg?v=9&encoding=json"]
 
 
+def test_default_zlib_stream_client_end_to_end():
+    """The default client negotiates compress=zlib-stream; the whole stack
+    (URL, shared inflator, READY dispatch) must survive it."""
+    from test_gateway import FakeWS, ZlibServer, hello, ready
+
+    srv = ZlibServer()
+    ws = FakeWS(srv.frame(hello()) + srv.frame(ready()))
+    bot = Client("tok", profile="web")  # default encoding is zlib-stream
+    bot.http.session = Wire(ws)  # type: ignore[assignment]
+
+    async def fake_boot():
+        return None
+
+    bot.boot = fake_boot  # type: ignore[assignment]
+
+    @bot.event
+    async def on_ready():
+        pass
+
+    async def main():
+        task = asyncio.create_task(bot.run())
+        await asyncio.sleep(0.05)
+        assert not task.done(), "run() returned while still connected"
+        assert bot.user is not None and bot.user.id == "9"
+        await bot.wait_until_ready(timeout=1)
+        await bot.close()
+        await asyncio.wait_for(task, 2)
+
+    run(main())
+    assert bot.closed is True
+    assert bot.http.session.urls == [
+        "wss://gateway.discord.gg?v=9&encoding=json&compress=zlib-stream"
+    ]
+
+
 def test_proxy_and_timeout_are_reachable():
     """They existed on DespiseHttp but no Client path forwarded them."""
     c = Client("tok", proxy="http://127.0.0.1:8080", timeout=12.0)
@@ -437,6 +652,31 @@ def test_close_releases_the_session_cache():
     run(c.close())
     assert cache._closed is True
     assert c.session_cache is None
+
+
+# -- cache caps -------------------------------------------------------------
+def test_cache_caps_are_keyword_mapped():
+    """Regression: caps splatted as positional args hit EntityCache's
+    keyword-only signature and raised TypeError for anyone passing them."""
+    c = Client("tok", cache_caps=(1, 2, 3))
+    assert c.cache.guilds._cap == 1
+    assert c.cache.channels._cap == 2
+    assert c.cache.users._cap == 3
+    run(c.http.close())
+
+
+def test_cache_caps_default_when_omitted():
+    from despise.cache import (
+        DEFAULT_CHANNEL_CAP,
+        DEFAULT_GUILD_CAP,
+        DEFAULT_USER_CAP,
+    )
+
+    c = Client("tok")
+    assert c.cache.guilds._cap == DEFAULT_GUILD_CAP
+    assert c.cache.channels._cap == DEFAULT_CHANNEL_CAP
+    assert c.cache.users._cap == DEFAULT_USER_CAP
+    run(c.http.close())
 
 
 def test_two_clients_same_token_share_one_cache():

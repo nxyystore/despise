@@ -50,7 +50,7 @@ log = logging.getLogger("despise.http")
 API_BASE = "https://discord.com/api/v9"
 
 # Join/accept/friends context presets (X-Context-Properties, base64 JSON).
-CONTEXT_PROPERTIES = {
+CONTEXT_PROPERTIES: dict[str, dict] = {
     "join": {"location": "Join Guild", "location_guild_id": None},
     "accept": {"location": "Accept Invite Page"},
     "friends": {"location": "Add Friend"},
@@ -103,7 +103,7 @@ class DespiseHttp:
         # No base_url on the session: request() builds absolute URLs itself so
         # that a caller can hand us a full https:// URL (CDN, webhook) without
         # curl_cffi's urljoin silently resolving it against the API host.
-        self.session = AsyncSession(
+        self.session: Any = AsyncSession(
             impersonate=profile.impersonate,
             proxy=proxy,
             timeout=timeout,
@@ -120,6 +120,12 @@ class DespiseHttp:
         # unrelated routes from tripping each other's limits.
         self._user_bucket = RateLimitBucket()
         self._global_until = 0.0
+        # A 401 on an authenticated request means the token is dead. Once
+        # tripped, this object refuses to keep talking to Discord: the caller
+        # (a Client) stops the gateway too. There is nothing to resume.
+        self._auth_dead = False
+        self._auth_error: HTTPError | None = None
+        self._on_auth_dead: list = []
 
     # -- headers ---------------------------------------------------------
     @property
@@ -169,6 +175,36 @@ class DespiseHttp:
         self._token = token
         self._headers.pop("X-Fingerprint", None)
         self._sync_headers()
+
+    # -- auth circuit breaker --------------------------------------------
+    @property
+    def auth_dead(self) -> bool:
+        """True once a 401 proved the token no longer works."""
+        return self._auth_dead
+
+    def on_auth_dead(self, callback) -> None:
+        """Register ``callback(exc)`` to run when the token is rejected.
+
+        The Client uses this to stop the gateway: a dead token has nothing
+        to resume, so reconnecting would only burn the Identify budget.
+        """
+        self._on_auth_dead.append(callback)
+
+    def trip_auth(self, exc: HTTPError) -> None:
+        """Mark the token dead and notify watchers. Idempotent.
+
+        After this, authenticated requests fail fast with no network call,
+        so a rejected token is never hammered.
+        """
+        if self._auth_dead:
+            return
+        self._auth_dead = True
+        self._auth_error = exc
+        for callback in list(self._on_auth_dead):
+            try:
+                callback(exc)
+            except Exception:  # a bad watcher must not mask the 401
+                log.debug("auth-dead callback raised", exc_info=True)
 
     # -- rate limit routing ----------------------------------------------
     def _bucket_key(self, method: str, path: str) -> str:
@@ -236,13 +272,15 @@ class DespiseHttp:
         if precision == "millisecond":
             seconds /= 1000.0
 
-        target = time.monotonic() + seconds
+        deadline = time.monotonic() + seconds
         if scope == "global":
-            self._global_until = max(self._global_until, target)
+            self._global_until = max(self._global_until, deadline)
         else:
             # Never shorten an existing reset: several routes can share one
             # bucket, and a short window from one must not unblock others.
-            bucket.reset_at = max(bucket.reset_at, target) if bucket.reset_at else target
+            bucket.reset_at = (
+                max(bucket.reset_at, deadline) if bucket.reset_at else deadline
+            )
 
     def _url(self, path: str) -> str:
         return path if path.startswith(("http://", "https://")) else f"{self.api_base}{path}"
@@ -274,6 +312,7 @@ class DespiseHttp:
         path: str,
         *,
         fields: dict | None = None,
+        files: list[dict] | None = None,
         file_field: str = "file",
         filename: str = "upload.png",
         data: bytes | None = None,
@@ -282,12 +321,30 @@ class DespiseHttp:
         method: str = "POST",
         reason: str | None = None,
     ) -> dict | list:
-        """multipart/form-data upload (avatars, banners, emoji, ...).
+        """multipart/form-data upload (attachments, avatars, banners, ...).
 
         curl_cffi does not support a ``files=`` kwarg; multipart bodies are
         built with ``CurlMime`` and handed to the session as ``multipart=``.
+
+        Two ways to attach bytes: the single-file ``data``/``local_path``
+        pair kept for callers that predate multi-file sends, or ``files`` -- a
+        list of dicts with ``filename`` plus ``data`` (or ``local_path``), an
+        optional ``content_type``, and an optional ``field`` name (defaults to
+        ``files[N]``, which is what Discord's message upload wants).
         """
         from curl_cffi import CurlMime
+
+        parts: list[dict] = list(files or [])
+        if data is not None or local_path is not None:
+            parts.append(
+                {
+                    "filename": filename,
+                    "content_type": content_type,
+                    "data": data,
+                    "local_path": local_path,
+                    "field": file_field,
+                }
+            )
 
         mime = CurlMime()
         try:
@@ -296,13 +353,14 @@ class DespiseHttp:
                     name=name,
                     data=value if isinstance(value, bytes) else str(value).encode(),
                 )
-            if data is not None or local_path is not None:
+            for index, part in enumerate(parts):
                 mime.addpart(
-                    name=file_field,
-                    filename=filename,
-                    content_type=content_type,
-                    data=data,
-                    local_path=local_path,
+                    name=part.get("field") or f"files[{index}]",
+                    filename=part.get("filename") or f"file{index}",
+                    content_type=part.get("content_type")
+                    or "application/octet-stream",
+                    data=part.get("data"),
+                    local_path=part.get("local_path"),
                 )
             result = await self._send(
                 method,
@@ -329,6 +387,10 @@ class DespiseHttp:
         multipart: Any = None,
     ) -> dict | list:
         method = method.upper()
+        if auth and self._token and self._auth_dead:
+            # The token was already rejected once; don't touch the network.
+            assert self._auth_error is not None
+            raise self._auth_error
         # Only genuinely per-request headers go here; the frozen set already
         # lives on the session.
         headers: dict[str, str] = {}
@@ -380,6 +442,13 @@ class DespiseHttp:
                         await asyncio.sleep(1 + attempt)
                         continue
                     raise self._build_error(r, method, path)
+
+                if r.status_code == 401 and auth and self._token:
+                    # The token is dead: trip the breaker so the Client stops
+                    # the gateway, and re-raise for this caller.
+                    exc = self._build_error(r, method, path)
+                    self.trip_auth(exc)
+                    raise exc
 
                 if r.status_code >= 400:
                     raise self._build_error(r, method, path)
