@@ -1,9 +1,11 @@
 """Lightweight id -> model cache.
 
-Deliberately *not* a member cache. Guild objects and channel lists are small
-and are re-sent constantly by the gateway, so holding the latest copy saves a
-round trip on every ``get_channel``. Users are cached because message authors
-show up in almost every payload and re-fetching each one would be absurd.
+Guild objects and channel lists are small and are re-sent constantly by the
+gateway, so holding the latest copy saves a round trip on every
+``get_channel``. Users are cached because message authors show up in almost
+every payload and re-fetching each one would be absurd. Members are indexed
+from READY and member dispatches so the synchronous ``get_member`` can answer
+without a network call.
 
 Bounded per type (insertion-ordered dict, oldest evicted first) so a bot in
 large guilds cannot grow without limit.
@@ -70,8 +72,8 @@ class _Bounded:
 class EntityCache:
     """Holds the most recent copy of the entities we are commonly asked for.
 
-    Never a source of truth: ``Client.get_*`` fetches through REST on a miss
-    and falls back to the cache only when the request fails.
+    ``Client.get_*`` checks this cache first and only reaches for REST on a
+    miss, so an entity already seen on the gateway costs no round trip.
     """
 
     def __init__(

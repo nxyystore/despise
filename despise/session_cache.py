@@ -248,6 +248,7 @@ class SessionCache:
         self.backend = backend
         self._last_save = 0.0
         self._closed = False
+        self._refs = 0
         # A distinct backend per instance: nothing is shared unless the caller
         # goes through for_token(). Use hashlib for a stable, non-secret hash.
         token_hash = hashlib.md5(token.encode("utf-8")).hexdigest()
@@ -335,10 +336,20 @@ def for_token(
     """
     shared_key = (token, backend)
     if (found := _shared.get(shared_key)) is not None and not found._closed:
+        found._refs += 1
         return found
     created = SessionCache(token, backend=backend, ttl=ttl, name=name)
+    created._refs = 1
     _shared[shared_key] = created
     return created
+
+
+async def release(cache: SessionCache) -> None:
+    """Drop one reference to a shared cache, closing it when none remain."""
+    cache._refs = max(0, cache._refs - 1)
+    if cache._refs == 0:
+        forget(cache)
+        await cache.close()
 
 
 def forget(cache: SessionCache) -> None:

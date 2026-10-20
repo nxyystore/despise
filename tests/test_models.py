@@ -53,6 +53,17 @@ def test_idless_models_are_never_equal():
     assert User({}) != User({})
 
 
+def test_idless_models_are_equal_to_themselves():
+    embed = Embed({"title": "t"})
+    assert embed == embed
+    assert embed != Embed({"title": "t"})
+
+
+def test_invite_uses_its_code_as_identity():
+    assert Invite({"code": "abc"}) == Invite({"code": "abc"})
+    assert Invite({"code": "abc"}) != Invite({"code": "xyz"})
+
+
 def test_id_is_a_string_attribute():
     assert User({"id": 123}).id == "123"
     assert User({}).id == ""
@@ -208,6 +219,14 @@ def test_message_defaults_are_safe():
     assert m.guild_id == ""
 
 
+def test_message_thread_is_a_channel():
+    m = Message({"id": "m", "thread": {"id": "t1", "type": 11, "name": "topic"}})
+    assert m.thread is not None
+    assert m.thread.id == "t1"
+    assert m.thread.name == "topic"
+    assert m.thread.is_thread
+
+
 def test_clean_content_strips_mentions_and_markdown():
     m = Message(
         {
@@ -282,6 +301,22 @@ def test_guild_features_tolerates_a_string():
     assert Guild({"features": "not-a-list"}).features == []
 
 
+def test_guild_preview_keeps_approximate_counts():
+    g = Guild(
+        {
+            "id": "g",
+            "name": "preview",
+            "approximate_member_count": 1200,
+            "approximate_presence_count": 42,
+            "discovery_splash": "splash",
+        }
+    )
+    assert g.member_count == 1200
+    assert g.approximate_member_count == 1200
+    assert g.approximate_presence_count == 42
+    assert g.discovery_splash == "splash"
+
+
 # -- new models -------------------------------------------------------------
 def test_member_falls_back_to_user_id():
     m = Member({"user": {"id": "u9"}, "nick": "n"})
@@ -327,3 +362,46 @@ def test_user_avatar_url():
 def test_user_display_name_prefers_global_name():
     assert User({"username": "u", "global_name": "G"}).display_name == "G"
     assert User({"username": "u"}).display_name == "u"
+
+
+def test_user_profile_fields():
+    user = User(
+        {
+            "id": "1",
+            "bio": "hello",
+            "pronouns": "they/them",
+            "banner": "banner-hash",
+            "avatar_decoration_data": {"sku_id": "sku1", "asset": "decor"},
+            "display_name_styles": {"font_id": 3, "effect_id": 2, "colors": [1, 2]},
+        }
+    )
+    assert user.bio == "hello"
+    assert user.pronouns == "they/them"
+    assert user.banner == "banner-hash"
+    assert user.avatar_decoration_data["sku_id"] == "sku1"
+    assert user.display_name_styles["font_id"] == 3
+
+
+def test_member_guild_profile_fields():
+    member = Member(
+        {
+            "guild_id": "g1",
+            "user": {"id": "u1"},
+            "bio": "guild bio",
+            "pronouns": "any",
+            "banner": "banner-hash",
+            "accent_color": 0xFF0000,
+            "theme_colors": [1, 2],
+            "avatar_decoration_data": {"sku_id": "sku1"},
+            "display_name_styles": {"font_id": 3},
+            "profile_effect": {"id": "effect1"},
+        }
+    )
+    assert member.bio == "guild bio"
+    assert member.pronouns == "any"
+    assert member.banner == "banner-hash"
+    assert member.accent_color == 0xFF0000
+    assert member.theme_colors == [1, 2]
+    assert member.avatar_decoration_data["sku_id"] == "sku1"
+    assert member.display_name_styles["font_id"] == 3
+    assert member.profile_effect["id"] == "effect1"

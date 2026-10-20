@@ -20,7 +20,7 @@ import asyncio
 import inspect
 import logging
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from typing import Any
 
 from .cache import EntityCache
@@ -61,8 +61,10 @@ class Client:
         version_resolver=None,
         cache_caps: tuple[int, int, int] | None = None,
         command_prefix: str = "!",
+        owner_ids: Iterable[str] | None = None,
     ) -> None:
         self.token = token
+        self.owner_ids = {str(owner) for owner in (owner_ids or ())}
         self._preset = profile
         self._locale = locale
         self._timezone = timezone
@@ -121,15 +123,18 @@ class Client:
         self._raw_listeners: dict[str, list] = {}
         self._client_waiters: dict[str, list] = {}
         self._bridged: set[str] = set()
+        self.tasks: list[Task] = []
+        self.version_resolver = coerce_resolver(version_resolver)
+        # Cache listeners must be registered *before* the raw bridges, so an
+        # event handler that calls get_guild/get_channel during dispatch sees
+        # the freshly-updated cache.
+        self._register_cache_listeners()
         # Bridge every known dispatch up front. Seeding (READY guilds) and
         # wait_for must work even when the user registers no listeners.
         from .events import RAW_TO_FRIENDLY as _RAW_TO_FRIENDLY
 
         for _raw in _RAW_TO_FRIENDLY:
             self._ensure_bridge(_raw)
-        self.tasks: list[Task] = []
-        self.version_resolver = coerce_resolver(version_resolver)
-        self._register_cache_listeners()
         self.command_prefix = command_prefix
         from .cmd import ModuleManager
 
@@ -211,7 +216,14 @@ class Client:
             for g in payload.get("guilds", []) or []:
                 if isinstance(g, dict) and not g.get("unavailable"):
                     try:
-                        self.cache.put_guild(Guild(g))
+                        guild = Guild(g)
+                        self.cache.put_guild(guild)
+                        # READY embeds the member list (possibly truncated for
+                        # large guilds); index what is there so get_member()
+                        # works before the first member dispatch.
+                        for member in guild.members:
+                            member.guild_id = guild.id
+                            self.cache.put_member(member)
                     except Exception:
                         continue
             for c in payload.get("private_channels", []) or []:
@@ -317,22 +329,19 @@ class Client:
     async def get_guild(self, guild_id: str):
         """Cached guild, else fetched over REST.
 
-        Falls back to the cached copy if the request fails -- a guild we are
-        already in is not worth failing an event handler over.
+        Returns ``None`` only when Discord says the guild is missing or
+        inaccessible; transport/auth errors propagate.
         """
         key = str(guild_id)
         cached = self.cache.get_guild(key)
         if cached is not None:
-            return cached
+            return cached._bind(self)
         try:
             guild = await self.rest.get_guild(key)
-        except NotFound:
-            return None
-        except DespiseError as exc:
-            log.debug("get_guild(%s) failed: %r", key, exc)
+        except (NotFound, Forbidden):
             return None
         self.cache.put_guild(guild)
-        return guild
+        return guild._bind(self)
 
     async def get_channel(self, channel_id: str):
         key = str(channel_id)
@@ -342,9 +351,6 @@ class Client:
         try:
             data = await self.http.request("GET", f"/channels/{key}")
         except (NotFound, Forbidden):
-            return None
-        except DespiseError as exc:
-            log.debug("get_channel(%s) failed: %r", key, exc)
             return None
         assert isinstance(data, dict)
         channel = Channel(data)
@@ -360,17 +366,20 @@ class Client:
             data = await self.http.request("GET", f"/users/{key}")
         except (NotFound, Forbidden):
             return None
-        except DespiseError as exc:
-            log.debug("get_user(%s) failed: %r", key, exc)
-            return None
         assert isinstance(data, dict)
         user = User(data)
         self.cache.put_user(user)
         return user._bind(self)
 
     def get_member(self, user_id: str, guild_id: str):
-        """Cache-only member lookup (no lazy fetch)."""
-        return self.cache.get_member(user_id, guild_id)
+        """Cache-only member lookup (no lazy fetch).
+
+        Members seen in READY, member dispatches, and guild messages are
+        indexed; use ``await rest.get_member(guild_id, user_id)`` for a
+        guaranteed fetch.
+        """
+        member = self.cache.get_member(user_id, guild_id)
+        return member._bind(self) if member is not None else None
 
     def clear_cache(self) -> None:
         self.cache.clear()
@@ -632,10 +641,9 @@ class Client:
         await self.gateway.close()
         await self.http.close()
         if self.session_cache is not None:
-            from .session_cache import forget
+            from .session_cache import release
 
-            await self.session_cache.close()
-            forget(self.session_cache)
+            await release(self.session_cache)
             self.session_cache = None
 
     async def __aenter__(self) -> Client:

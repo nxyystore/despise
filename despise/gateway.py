@@ -211,7 +211,7 @@ class Gateway:
         timeout: float | None = None,
     ):
         """Await the next ``event`` whose payload satisfies ``check``."""
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         fut: asyncio.Future = loop.create_future()
         entry = (fut, check)
         self._waiters.setdefault(event, []).append(entry)
@@ -527,9 +527,11 @@ class Gateway:
                     data = msg.get("d") or {}
                     kind = msg.get("t") or "GUILD_MEMBERS_UPDATE"
                     await self._emit(kind, data)
-                    await self._emit("GUILD_MEMBERS_UPDATE", data)
+                    if kind != "GUILD_MEMBERS_UPDATE":
+                        await self._emit("GUILD_MEMBERS_UPDATE", data)
                     await self._settle_waiters(kind, data)
-                    await self._settle_waiters("GUILD_MEMBERS_UPDATE", data)
+                    if kind != "GUILD_MEMBERS_UPDATE":
+                        await self._settle_waiters("GUILD_MEMBERS_UPDATE", data)
                 elif op == HEARTBEAT:
                     await self._send_frame(ws, {"op": HEARTBEAT, "d": self.seq})
                 elif op in (HELLO, 0):

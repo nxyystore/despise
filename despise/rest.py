@@ -19,11 +19,22 @@ import base64
 import json
 import logging
 import os
+from datetime import datetime
 from urllib.parse import quote
 
 from .gateway import PRESENCE_MIN_INTERVAL_S
 from .http import DespiseHttp
-from .models import Channel, Guild, Invite, Member, Message, Relationship, Role, User
+from .models import (
+    Channel,
+    Emoji,
+    Guild,
+    Invite,
+    Member,
+    Message,
+    Relationship,
+    Role,
+    User,
+)
 
 log = logging.getLogger("despise.rest")
 
@@ -232,6 +243,29 @@ def _resolve_files(files) -> list[File]:
     return out
 
 
+def _isoformat(value) -> str:
+    """Render a datetime (or an already-formatted string) as ISO8601."""
+    isoformat = getattr(value, "isoformat", None)
+    return isoformat() if callable(isoformat) else str(value)
+
+
+def _normalise_embeds(embeds):
+    """Turn model embeds into JSON-ready dicts (plain dicts pass through)."""
+    out = []
+    for embed in embeds:
+        to_dict = getattr(embed, "to_dict", None)
+        out.append(to_dict() if callable(to_dict) else embed)
+    return out
+
+
+def _normalise_response(response: dict) -> dict:
+    """Copy an interaction response with model embeds converted to dicts."""
+    data = response.get("data")
+    if isinstance(data, dict) and isinstance(data.get("embeds"), list):
+        return {**response, "data": {**data, "embeds": _normalise_embeds(data["embeds"])}}
+    return response
+
+
 def _emoji_param(emoji) -> str:
     """Turn an emoji into the path segment a reaction route expects.
 
@@ -239,8 +273,6 @@ def _emoji_param(emoji) -> str:
     (``<:name:id>`` / ``<a:name:id>``), a ``name:id`` pair, or a unicode
     emoji. The result is unquoted; callers quote it when building the URL.
     """
-    from .models import Emoji
-
     if isinstance(emoji, Emoji):
         return f"{emoji.name}:{emoji._id}" if emoji._id else emoji.name
     name = str(emoji)
@@ -249,6 +281,30 @@ def _emoji_param(emoji) -> str:
         if len(parts) == 3:  # a:name:id or :name:id
             return f"{parts[1]}:{parts[2]}"
     return name
+
+
+def _custom_status_emoji(emoji) -> tuple[str | None, str | None]:
+    """Split a custom-status emoji into Discord's mutually exclusive fields.
+
+    Custom emoji (an :class:`~despise.models.Emoji`, ``<:name:id>`` mention,
+    or ``name:id`` pair) become ``emoji_id``. A unicode emoji becomes
+    ``emoji_name``.
+    """
+    if emoji is None:
+        return None, None
+    if isinstance(emoji, Emoji):
+        return (emoji._id, None) if emoji._id else (None, emoji.name)
+
+    value = str(emoji)
+    if value.startswith("<") and value.endswith(">"):
+        parts = value.strip("<>").split(":")
+        if len(parts) == 3 and parts[2]:
+            return parts[2], None
+    if ":" in value:
+        _, _, emoji_id = value.rpartition(":")
+        if emoji_id:
+            return emoji_id, None
+    return None, value
 
 
 class Rest:
@@ -411,7 +467,7 @@ class Rest:
         if content is not None:
             payload["content"] = content
         if embeds is not None:
-            payload["embeds"] = embeds
+            payload["embeds"] = _normalise_embeds(embeds)
         if components is not None:
             payload["components"] = components
         if poll is not None:
@@ -465,7 +521,7 @@ class Rest:
         if content is not None:
             payload["content"] = content
         if embeds is not None:
-            payload["embeds"] = embeds
+            payload["embeds"] = _normalise_embeds(embeds)
         if components is not None:
             payload["components"] = components
         if allowed_mentions is not None:
@@ -535,11 +591,14 @@ class Rest:
     async def typing(self, channel_id: str) -> None:
         await self.http.request("POST", f"/channels/{channel_id}/typing")
 
-    def typing_loop(self, channel_id: str, *, interval: float = 10.0) -> TypingLoop:
+    def typing_loop(
+        self, channel_id: str, *, interval: float = TYPING_REFRESH_S
+    ) -> TypingLoop:
         """A long-running typing indicator.
 
-        Discord expects a POST roughly every 10s while the user is typing, so
-        the one-shot ``typing()`` above expires almost immediately::
+        Discord expires the indicator roughly 10s after the last POST, so the
+        loop refreshes every :data:`TYPING_REFRESH_S` (8s) by default. The
+        one-shot ``typing()`` above expires almost immediately::
 
             async with bot.rest.typing_loop(cid):
                 await bot.rest.send_message(cid, "thinking about it...")
@@ -571,17 +630,29 @@ class Rest:
     async def pinned_messages(
         self, channel_id: str, *, limit: int = 50, before=None
     ) -> list[Message]:
-        """List a channel's pins (``GET .../messages/pins``)."""
+        """List a channel's pins (``GET .../messages/pins``).
+
+        Each response item is ``{"pinned_at": ..., "message": {...}}``; the
+        returned messages are the unwrapped ``message`` objects. ``before`` is
+        an ISO8601 timestamp (a ``datetime`` is converted automatically), not
+        a message snowflake.
+        """
         params: list[tuple[str, str]] = [("limit", str(limit))]
         if before is not None:
-            params.append(("before", str(before)))
+            params.append(("before", _isoformat(before)))
         data = await self.http.request(
             "GET", f"/channels/{channel_id}/messages/pins", params=params
         )
-        # The response wraps the pins in ``items`` (a list of messages).
-        items = data.get("items", data) if isinstance(data, dict) else data
+        items = data.get("items", []) if isinstance(data, dict) else data
         assert isinstance(items, list)
-        return [self._bind(Message(m)) for m in items]
+        messages = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            payload = item.get("message", item)
+            if isinstance(payload, dict):
+                messages.append(self._bind(Message(payload)))
+        return messages
 
     async def pin(self, channel_id: str, message_id: str) -> None:
         # Discord documents pins under ``/messages/pins``; the bare ``/pins``
@@ -672,10 +743,27 @@ class Rest:
             "POST", "/read-states/ack-bulk", json_data={"read_states": read_states}
         )
 
-    async def delete_read_state(self, read_state_id: str) -> None:
-        """Delete a read state by its resource id (any read-state type)."""
+    async def delete_read_state(
+        self,
+        read_state_id: str,
+        *,
+        read_state_type: int | None = None,
+        version: int | None = None,
+    ) -> None:
+        """Delete a read state by its resource id.
+
+        ``read_state_type`` selects the kind of resource (default CHANNEL);
+        pass it when deleting a guild/feature read state.
+        """
+        payload: dict = {}
+        if read_state_type is not None:
+            payload["read_state_type"] = read_state_type
+        if version is not None:
+            payload["version"] = version
         await self.http.request(
-            "DELETE", f"/channels/{read_state_id}/messages/ack"
+            "DELETE",
+            f"/channels/{read_state_id}/messages/ack",
+            json_data=payload or None,
         )
 
     # -- T2 -----------------------------------------------------------
@@ -895,25 +983,30 @@ class Rest:
         assert isinstance(data, list)
         return [Relationship(r) for r in data]
 
-    async def add_friend(self, user_id: str) -> Relationship:
-        data = await self.http.request(
+    async def add_friend(self, user_id: str, *, note: str | None = None) -> None:
+        """Send a friend request.
+
+        Discord returns ``204`` with no body, so there is no relationship
+        object to hand back; listen for ``RELATIONSHIP_ADD`` for that.
+        """
+        payload: dict = {}
+        if note is not None:
+            payload["note"] = note
+        await self.http.request(
             "PUT",
             f"/users/@me/relationships/{user_id}",
-            json_data={},
+            json_data=payload,
             context="friends",
         )
-        assert isinstance(data, dict)
-        return Relationship(data)
 
     async def remove_relationship(self, user_id: str) -> None:
         await self.http.request("DELETE", f"/users/@me/relationships/{user_id}")
 
-    async def block(self, user_id: str) -> Relationship:
-        data = await self.http.request(
+    async def block(self, user_id: str) -> None:
+        """Block a user (relationship type 2). Returns nothing (204)."""
+        await self.http.request(
             "PUT", f"/users/@me/relationships/{user_id}", json_data={"type": 2}
         )
-        assert isinstance(data, dict)
-        return Relationship(data)
 
     # -- users -----------------------------------------------------------
     async def get_user(self, user_id: str) -> User:
@@ -959,6 +1052,127 @@ class Rest:
             "PUT", f"/users/@me/notes/{user_id}", json_data={"note": note}
         )
 
+    # -- profile and settings -------------------------------------------
+    async def edit_profile(self, **fields) -> dict:
+        """PATCH the current user's profile.
+
+        Supported fields: ``bio``, ``pronouns``, ``banner``, ``accent_color``,
+        ``theme_colors``, ``profile_effect_id`` (plus deprecated Discord
+        fields). Pass ``None`` for a nullable field to clear it. Use
+        :meth:`set_banner` when uploading banner bytes.
+        """
+        data = await self.http.request(
+            "PATCH", "/users/@me/profile", json_data=fields
+        )
+        assert isinstance(data, dict)
+        return data
+
+    async def set_bio(self, bio: str | None) -> dict:
+        """Set the global profile bio. ``None`` clears it."""
+        return await self.edit_profile(bio=bio)
+
+    async def edit_user(self, **fields) -> dict:
+        """PATCH the current user account.
+
+        Supports ``avatar_decoration_sku_id``, ``display_name_font_id``,
+        ``display_name_effect_id``, ``display_name_colors``, ``bio``,
+        ``pronouns``, ``banner``, ``accent_color``, ``global_name``, and other
+        fields from Discord's Modify Current User endpoint. Pass ``None`` to
+        clear a nullable field.
+        """
+        data = await self.http.request("PATCH", "/users/@me", json_data=fields)
+        assert isinstance(data, dict)
+        return data
+
+    async def set_avatar_decoration(self, sku_id: str | None) -> dict:
+        """Equip an avatar decoration by SKU ID. ``None`` removes it."""
+        return await self.edit_user(avatar_decoration_sku_id=sku_id)
+
+    async def set_display_name_style(
+        self,
+        *,
+        font_id: int | None = None,
+        effect_id: int | None = None,
+        colors: list[int] | None = None,
+    ) -> dict:
+        """Set the display-name font, effect, and colors.
+
+        Omitted arguments are left unchanged. Pass all three to replace the
+        whole style; use :meth:`edit_user` with explicit ``None`` values to
+        clear individual fields. ``colors`` are hex integers.
+        """
+        payload: dict = {}
+        if font_id is not None:
+            payload["display_name_font_id"] = font_id
+        if effect_id is not None:
+            payload["display_name_effect_id"] = effect_id
+        if colors is not None:
+            payload["display_name_colors"] = colors
+        return await self.edit_user(**payload)
+
+    async def edit_guild_profile(self, guild_id: str, **fields) -> dict:
+        """PATCH the current user's profile in one guild.
+
+        Supported fields: ``pronouns``, ``bio``, ``banner``, ``accent_color``,
+        ``theme_colors``, ``profile_effect_id``. Pass ``None`` to clear a
+        nullable field.
+        """
+        data = await self.http.request(
+            "PATCH", f"/guilds/{guild_id}/profile/@me", json_data=fields
+        )
+        assert isinstance(data, dict)
+        return data
+
+    async def set_guild_bio(self, guild_id: str, bio: str | None) -> dict:
+        """Set the guild-specific bio. ``None`` clears it."""
+        return await self.edit_guild_profile(guild_id, bio=bio)
+
+    async def set_guild_nickname(
+        self,
+        guild_id: str,
+        nick: str | None,
+        *,
+        reason: str | None = None,
+    ) -> Member:
+        """Set the current user's nickname in one guild. ``None`` clears it."""
+        data = await self.http.request(
+            "PATCH",
+            f"/guilds/{guild_id}/members/@me",
+            json_data={"nick": nick},
+            reason=reason,
+        )
+        assert isinstance(data, dict)
+        return self._bind(Member({**data, "guild_id": str(guild_id)}))
+
+    async def set_custom_status(
+        self,
+        text: str | None = None,
+        *,
+        emoji: str | Emoji | None = None,
+        expires_at: datetime | str | None = None,
+    ) -> dict:
+        """Replace the custom status shown in the profile popout.
+
+        ``emoji`` accepts an :class:`~despise.models.Emoji`, a
+        ``<:name:id>`` / ``name:id`` custom emoji, or a unicode emoji.
+        Unspecified emoji and expiry are cleared, matching Discord's "replace
+        the status" behavior. ``set_custom_status(None)`` clears it.
+        """
+        emoji_id, emoji_name = _custom_status_emoji(emoji)
+        custom_status = {
+            "text": text,
+            "emoji_id": emoji_id,
+            "emoji_name": emoji_name,
+            "expires_at": _isoformat(expires_at) if expires_at is not None else None,
+        }
+        data = await self.http.request(
+            "PATCH",
+            "/users/@me/settings",
+            json_data={"custom_status": custom_status},
+        )
+        assert isinstance(data, dict)
+        return data
+
     # -- T5: interactions ---------------------------------------------
     async def run_interaction(self, payload: dict) -> None:
         """Send an interaction (``POST /interactions``).
@@ -971,17 +1185,56 @@ class Rest:
                 **interaction,          # t=2/4, id, application_id, data, ...
                 "session_id": session_id,
             })
+
+        When the Rest belongs to a connected Client, the gateway session id
+        is filled in automatically.
         """
+        payload = dict(payload)
+        if "session_id" not in payload and self._client is not None:
+            session_id = getattr(self._client.gateway, "session_id", None)
+            if session_id:
+                payload["session_id"] = session_id
         await self.http.request("POST", "/interactions", json_data=payload)
 
     async def interaction_callback(
-        self, interaction_id: str, token: str, response: dict
+        self,
+        interaction_id: str,
+        token: str,
+        response: dict,
+        *,
+        files=None,
     ) -> None:
-        """Answer an interaction. ``response`` comes from ``interactions.py``."""
-        await self.http.request(
-            "PUT",
-            f"/interactions/{interaction_id}/{token}/callback",
-            json_data=response,
+        """Answer an interaction. ``response`` comes from ``interactions.py``.
+
+        Pass ``files=`` for attachment uploads; they are sent as multipart
+        with attachment metadata added to the response automatically.
+        """
+        response = _normalise_response(response)
+        path = f"/interactions/{interaction_id}/{token}/callback"
+        resolved = _resolve_files(files)
+        if not resolved:
+            await self.http.request("PUT", path, json_data=response)
+            return
+        data = dict(response.get("data") or {})
+        data["attachments"] = [
+            {"id": index, "filename": item.filename}
+            for index, item in enumerate(resolved)
+        ]
+        response = {**response, "data": data}
+        await self.http.upload(
+            path,
+            method="PUT",
+            fields={"payload_json": json.dumps(response)},
+            files=[
+                {
+                    "field": f"files[{index}]",
+                    "filename": item.filename,
+                    "content_type": item.content_type,
+                    "data": item.data,
+                    "local_path": item.local_path,
+                }
+                for index, item in enumerate(resolved)
+            ],
         )
 
     async def edit_interaction_response(
@@ -989,7 +1242,6 @@ class Rest:
         application_id: str,
         token: str,
         *,
-        session_id: str | None = None,
         content: str | None = None,
         embeds: list | None = None,
         components: list | None = None,
@@ -999,11 +1251,9 @@ class Rest:
         if content is not None:
             payload["content"] = content
         if embeds is not None:
-            payload["embeds"] = embeds
+            payload["embeds"] = _normalise_embeds(embeds)
         if components is not None:
             payload["components"] = components
-        if session_id is not None:
-            payload["session_id"] = session_id
         data = await self.http.request(
             "PATCH",
             f"/webhooks/{application_id}/{token}/messages/@original",
@@ -1013,14 +1263,12 @@ class Rest:
         return self._bind(Message(data))
 
     async def original_response(
-        self, application_id: str, token: str, *, session_id: str | None = None
+        self, application_id: str, token: str
     ) -> Message:
         """GET the message an interaction created."""
-        params = {"session_id": session_id} if session_id else None
         data = await self.http.request(
             "GET",
             f"/webhooks/{application_id}/{token}/messages/@original",
-            params=params,
         )
         assert isinstance(data, dict)
         return self._bind(Message(data))
@@ -1033,15 +1281,21 @@ class Rest:
         assert isinstance(data, dict)
         return Invite(data)
 
-    async def follow_channel(self, channel_id: str, *, target_channel_id: str) -> Channel:
+    async def follow_channel(
+        self, channel_id: str, *, target_channel_id: str
+    ) -> dict:
+        """Follow a News channel into ``target_channel_id``.
+
+        Returns the followed-channel object (``{"channel_id", "webhook_id"}``),
+        not a :class:`Channel`.
+        """
         data = await self.http.request(
             "POST",
-            "/channels/followers",
-            json_data={"channel_id": channel_id},
-            params={"target_channel_id": target_channel_id},
+            f"/channels/{channel_id}/followers",
+            json_data={"webhook_channel_id": str(target_channel_id)},
         )
         assert isinstance(data, dict)
-        return self._bind(Channel(data))
+        return data
 
     async def create_webhook(self, channel_id: str, name: str) -> dict:
         data = await self.http.request(
@@ -1075,7 +1329,7 @@ class Rest:
         if avatar_url is not None:
             payload["avatar_url"] = avatar_url
         if embeds is not None:
-            payload["embeds"] = embeds
+            payload["embeds"] = _normalise_embeds(embeds)
         if components is not None:
             payload["components"] = components
         if not payload:
@@ -1123,7 +1377,7 @@ class Rest:
             "channel_id": newsletter_id,
         }
         if embeds is not None:
-            fields["embedded"] = {"embeds": embeds}
+            fields["embedded"] = {"embeds": _normalise_embeds(embeds)}
         parts = {"payload_json": json.dumps(fields)}
         for index, item in enumerate(files or []):
             parts[f"files[{index}]"] = item

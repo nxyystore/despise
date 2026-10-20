@@ -4,7 +4,13 @@ import asyncio
 
 import pytest
 
-from despise.session_cache import KEY_PREFIX, SessionCache, SessionState, for_token
+from despise.session_cache import (
+    KEY_PREFIX,
+    SessionCache,
+    SessionState,
+    for_token,
+    release,
+)
 
 
 def run(coro):
@@ -194,6 +200,21 @@ def test_for_token_builds_from_a_backend_url():
         return state
 
     assert run(main()).session_id == "s"
+
+
+def test_release_keeps_a_shared_cache_open_until_the_last_client():
+    a = for_token("tok-SHARED")
+    b = for_token("tok-SHARED")
+
+    async def main():
+        await release(a)
+        assert not b._closed
+        await b.save("sess-2", 2)
+        await release(b)
+        return b._closed
+
+    assert run(main()) is True
+    assert for_token("tok-SHARED") is not a
 
 
 def test_no_extra_needed_for_builtin_cache():

@@ -74,10 +74,38 @@ class Model:
         # stay unbound, and their action methods raise rather than guess.
         self._client = None
 
-    def _bind(self, client):
-        """Attach a Client so action methods (``msg.reply``) work."""
+    def _bind(self, client, _seen: set[int] | None = None):
+        """Attach a Client so action methods (``msg.reply``) work.
+
+        Nested models (``guild.channels``, ``message.referenced_message``,
+        ...) are bound too, so action methods work no matter which object the
+        caller reaches first.
+        """
+        if _seen is None:
+            _seen = set()
+        if id(self) in _seen:
+            return self
+        _seen.add(id(self))
         self._client = client
+        for cls in type(self).__mro__:
+            slots = getattr(cls, "__slots__", ())
+            if isinstance(slots, str):
+                slots = (slots,)
+            for name in slots:
+                if name in ("_raw", "_id", "_client"):
+                    continue
+                value = getattr(self, name, None)
+                if isinstance(value, Model):
+                    value._bind(client, _seen)
+                elif isinstance(value, list):
+                    for item in value:
+                        if isinstance(item, Model):
+                            item._bind(client, _seen)
         return self
+
+    def to_dict(self) -> dict:
+        """JSON-ready payload for this model."""
+        return self._raw
 
     @property
     def _bound_client(self):
@@ -99,12 +127,16 @@ class Model:
         return self._raw
 
     def __eq__(self, other: object) -> bool:
-        if isinstance(other, Model):
-            return bool(self._id) and self._id == other._id
-        return NotImplemented
+        if not isinstance(other, Model):
+            return NotImplemented
+        if self._id or other._id:
+            # Snowflakes are globally unique, so cross-type id equality is safe.
+            return self._id == other._id
+        # No snowflake (Embed, ...): only the same instance is equal.
+        return self is other
 
     def __hash__(self) -> int:
-        return hash(self._id)
+        return hash(self._id) if self._id else object.__hash__(self)
 
     def __repr__(self) -> str:  # pragma: no cover - debugging aid
         return f"<{type(self).__name__} {self._id}>"
@@ -144,6 +176,11 @@ class User(Model):
         "public_flags",
         "accent_color",
         "display_name",
+        "bio",
+        "pronouns",
+        "banner",
+        "avatar_decoration_data",
+        "display_name_styles",
     )
 
     def __init__(self, data: dict | None) -> None:
@@ -159,6 +196,11 @@ class User(Model):
         self.public_flags = payload.get("public_flags", 0)
         self.accent_color = payload.get("accent_color")
         self.display_name = self.global_name or self.username
+        self.bio = payload.get("bio")
+        self.pronouns = payload.get("pronouns")
+        self.banner = payload.get("banner")
+        self.avatar_decoration_data = payload.get("avatar_decoration_data") or {}
+        self.display_name_styles = payload.get("display_name_styles") or {}
 
     @property
     def avatar_url(self) -> str | None:
@@ -188,6 +230,14 @@ class Member(Model):
         "communication_disabled_until",
         "avatar",
         "boosting_since",
+        "bio",
+        "pronouns",
+        "banner",
+        "accent_color",
+        "theme_colors",
+        "avatar_decoration_data",
+        "display_name_styles",
+        "profile_effect",
     )
 
     def __init__(self, data: dict | None) -> None:
@@ -211,6 +261,14 @@ class Member(Model):
             payload.get("communication_disabled_until")
         )
         self.avatar = payload.get("avatar")
+        self.bio = payload.get("bio")
+        self.pronouns = payload.get("pronouns")
+        self.banner = payload.get("banner")
+        self.accent_color = payload.get("accent_color")
+        self.theme_colors = payload.get("theme_colors") or []
+        self.avatar_decoration_data = payload.get("avatar_decoration_data") or {}
+        self.display_name_styles = payload.get("display_name_styles") or {}
+        self.profile_effect = payload.get("profile_effect")
 
     @property
     def display_name(self) -> str:
@@ -611,7 +669,7 @@ class Message(Model):
         self.activity = payload.get("activity") or {}
         self.interaction = payload.get("interaction") or {}
         thread = payload.get("thread")
-        self.thread = _nested({"id": (thread or {}).get("id")}, "id", Channel) if isinstance(thread, dict) else None
+        self.thread = _nested(payload, "thread", Channel) if isinstance(thread, dict) else None
         self.position_in_thread = payload.get("position_in_thread")
 
     @property
@@ -827,8 +885,12 @@ class Guild(Model):
         "name",
         "icon",
         "banner",
+        "discovery_splash",
         "owner_id",
         "member_count",
+        "approximate_member_count",
+        "approximate_presence_count",
+        "premium_subscription_count",
         "channels",
         "members",
         "roles",
@@ -851,8 +913,15 @@ class Guild(Model):
         self.name = payload.get("name", "")
         self.icon = payload.get("icon")
         self.banner = payload.get("banner")
+        self.discovery_splash = payload.get("discovery_splash")
         self.owner_id = str(payload.get("owner_id") or "")
         self.member_count = payload.get("member_count")
+        self.approximate_member_count = payload.get("approximate_member_count")
+        self.approximate_presence_count = payload.get("approximate_presence_count")
+        self.premium_subscription_count = payload.get("premium_subscription_count")
+        # Guild previews expose approximate counts instead of member_count.
+        if self.member_count is None:
+            self.member_count = self.approximate_member_count
         self.channels = _child_list(payload, "channels", Channel)
         self.members = _child_list(payload, "members", Member)
         self.roles = _child_list(payload, "roles", Role)
@@ -895,6 +964,8 @@ class Invite(Model):
         super().__init__(data)
         payload = self._raw
         self.code = payload.get("code") or self._id
+        if not self._id and self.code:
+            self._id = str(self.code)
         self.guild = _nested(payload, "guild", Guild)
         self.channel = _nested(payload, "channel", Channel)
         self.inviter = _nested(payload, "inviter", User)

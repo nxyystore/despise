@@ -111,7 +111,7 @@ def validate_command(names, fn) -> None:
             )
 
 
-def usage_for(invoked: str, fn) -> str:
+def usage_for(invoked: str, fn, *, prefix: str = "!") -> str:
     """Render ``!ban <member> [reason] <rest...>`` from the signature."""
     _, params = _split_params(fn)
     parts = []
@@ -122,7 +122,8 @@ def usage_for(invoked: str, fn) -> str:
             parts.append(f"<{p.name}>")
         else:
             parts.append(f"[{p.name}]")
-    return f"!{invoked} " + " ".join(parts) if parts else f"!{invoked}"
+    head = f"{prefix}{invoked}"
+    return f"{head} " + " ".join(parts) if parts else head
 
 
 def _convert_scalar(annotation, raw: str, usage: str):
@@ -164,6 +165,14 @@ def _names_equal(want: str, *have: Any) -> bool:
     return any(isinstance(h, str) and h.casefold() == folded for h in have if h)
 
 
+async def _safe_lookup(coro):
+    """Await a Client/REST lookup, treating transport failures as not found."""
+    try:
+        return await coro
+    except DespiseError:
+        return None
+
+
 async def _convert_entity(bot: Any, ctx: Context, annotation, raw: str, usage: str):
     message = ctx.message
     guild_id = str(getattr(message, "guild_id", "") or "")
@@ -171,13 +180,13 @@ async def _convert_entity(bot: Any, ctx: Context, annotation, raw: str, usage: s
 
     if annotation is User:
         uid = _mention_or_id(_USER_MENTION_RE, raw) or raw.strip()
-        user = await bot.get_user(uid) if uid else None
+        user = await _safe_lookup(bot.get_user(uid)) if uid else None
         if user is None:
             raise UsageError(f"no user matching {raw!r}", usage=usage)
         return user
 
     if annotation is Guild:
-        guild = await bot.get_guild(raw.strip()) if raw.strip() else None
+        guild = await _safe_lookup(bot.get_guild(raw.strip())) if raw.strip() else None
         if guild is None:
             raise UsageError(f"no server matching {raw!r}", usage=usage)
         return guild
@@ -200,43 +209,54 @@ async def _convert_entity(bot: Any, ctx: Context, annotation, raw: str, usage: s
     if not guild_id:
         need = {Member: "members", Channel: "channels", Role: "roles"}[annotation]
         raise UsageError(f"{need} need a server; this is not one", usage=usage)
-    guild = await bot.get_guild(guild_id)
 
     if annotation is Member:
         member_id = _mention_or_id(_USER_MENTION_RE, raw)
         if member_id:
             member = bot.get_member(member_id, guild_id)
-            if member is None:
-                raise UsageError(f"no member matching {raw!r} cached", usage=usage)
-            return member
-        member = bot.get_member(raw.strip(), guild_id)
-        if member is not None:
-            return member
-        for member in getattr(guild, "members", []) or []:
-            user = getattr(member, "user", None)
-            if _names_equal(
-                raw.strip(),
-                getattr(member, "nick", None),
-                getattr(member, "display_name", None),
-                getattr(user, "username", None),
-                getattr(user, "display_name", None),
-            ):
+            if member is not None:
                 return member
+        guild = await _safe_lookup(bot.get_guild(guild_id))
+        if guild is not None:
+            member = bot.get_member(raw.strip(), guild_id)
+            if member is not None:
+                return member
+            for member in getattr(guild, "members", []) or []:
+                user = getattr(member, "user", None)
+                if _names_equal(
+                    raw.strip(),
+                    getattr(member, "nick", None),
+                    getattr(member, "display_name", None),
+                    getattr(user, "username", None),
+                    getattr(user, "display_name", None),
+                ):
+                    return member
         raise UsageError(f"no member matching {raw!r}", usage=usage)
 
     if annotation is Channel:
-        cid = _mention_or_id(_CHANNEL_MENTION_RE, raw) or raw.strip()
+        cid = _mention_or_id(_CHANNEL_MENTION_RE, raw)
         if cid:
-            channel = await bot.get_channel(cid)
+            channel = await _safe_lookup(bot.get_channel(cid))
             if channel is not None:
                 return channel
+        elif raw.strip().isdigit():
+            channel = await _safe_lookup(bot.get_channel(raw.strip()))
+            if channel is not None:
+                return channel
+        else:
+            cache = getattr(bot, "cache", None)
+            cached = cache.get_channel(raw.strip()) if cache is not None else None
+            if cached is not None:
+                return cached._bind(bot)
         want = raw.strip().removeprefix("#")
+        guild = await _safe_lookup(bot.get_guild(guild_id))
         for channel in getattr(guild, "channels", []) or []:
             if _names_equal(want, getattr(channel, "name", None)):
                 return channel
         raise UsageError(f"no channel matching {raw!r}", usage=usage)
 
     if annotation is Role:
+        guild = await _safe_lookup(bot.get_guild(guild_id))
         roles = getattr(guild, "roles", []) or []
         want_id = _mention_or_id(_ROLE_MENTION_RE, raw) or raw.strip()
         for role in roles:
@@ -262,7 +282,8 @@ async def bind_command(fn, invoked: str, ctx: Context, args: list[str]):
     Returns ``(pass_ctx, call_args, call_kwargs)``. Raises ``UsageError``
     (with ``.usage`` set) for missing, extra, or unconvertible arguments.
     """
-    usage = usage_for(invoked, fn)
+    prefix = getattr(getattr(ctx, "bot", None), "command_prefix", "!")
+    usage = usage_for(invoked, fn, prefix=prefix)
     pass_ctx, params = _split_params(fn)
     resolved = {pname: _unwrap(t) for pname, t in _types(fn, params).items()}
     positional = [

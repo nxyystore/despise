@@ -725,4 +725,5 @@ def test_ready_seeds_guilds_and_normalizes_int_ids(monkeypatch):
     assert guild is not None and guild.name == "fan club"
     assert c.cache.get_channel("1550551194672435203") is not None
     assert c.cache.get_channel("915532208574455828") is not None
+    assert c.cache.get_member("975049360167563334", "1550551193908936745") is not None
     assert c.cache.get_guild("999") is None

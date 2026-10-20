@@ -102,6 +102,22 @@ def test_command_errors_reach_on_error(monkeypatch):
     run(c.close())
 
 
+def test_usage_uses_the_configured_prefix(monkeypatch):
+    class Prefixed(Module):
+        @command("add")
+        async def add(self, ctx, x: int):
+            pass
+
+    c, gw = patched(monkeypatch, command_prefix=".")
+    errors = []
+    c.on_error(lambda event, exc: errors.append((event, exc)))
+    c.modules.load(Prefixed)
+    run(gw._emit("MESSAGE_CREATE", msg_payload(".add")))
+    assert isinstance(errors[0][1], UsageError)
+    assert errors[0][1].usage == ".add <x>"
+    run(c.close())
+
+
 def test_scoped_on_error_only_hears_its_command(monkeypatch):
     class Boom(Module):
         @command("boom")

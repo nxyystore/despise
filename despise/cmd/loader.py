@@ -25,7 +25,9 @@ async def _check_gate(fn: Any, invoked: str, ctx: Context) -> None:
             name = getattr(pred, "__name__", "check")
             raise CheckFailure(
                 f"{name} blocked this command",
-                usage=usage_for(invoked, fn),
+                usage=usage_for(
+                    invoked, fn, prefix=getattr(ctx.bot, "command_prefix", "!")
+                ),
                 predicate=pred,
             )
 

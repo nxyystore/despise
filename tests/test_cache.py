@@ -1,7 +1,6 @@
 """Cache tests: population from dispatches, bounded eviction, lookup fallbacks."""
 
-
-
+import pytest
 from test_client import patched, run
 
 from despise.cache import EntityCache
@@ -115,6 +114,19 @@ def test_guild_create_populates_the_cache(monkeypatch):
     assert guild is not None and guild.name == "G"
 
 
+def test_event_handlers_see_the_cache_after_it_updates(monkeypatch):
+    client, gw = patched(monkeypatch)
+    seen = []
+
+    async def on_guild(guild):
+        seen.append(client.cache.get_guild(guild.id))
+
+    client.on("guild_join", on_guild)
+    run(gw._emit("GUILD_CREATE", {"id": "g1", "name": "G", "channels": []}))
+    assert seen == [client.cache.get_guild("g1")]
+    assert seen[0] is not None
+
+
 def test_guild_delete_drops_it(monkeypatch):
     client, gw = patched(monkeypatch)
 
@@ -221,6 +233,14 @@ def test_get_guild_returns_none_on_404():
 
     client = client_with([NotFound("nope")])
     assert run(client.get_guild("g1")) is None
+
+
+def test_get_guild_propagates_non_http_failures():
+    from despise.exceptions import ServerError
+
+    client = client_with([ServerError("boom")])
+    with pytest.raises(ServerError):
+        run(client.get_guild("g1"))
 
 
 def test_get_channel_fetches_and_caches():

@@ -4,13 +4,11 @@ A deliberate omission from the rest of the surface: this is just enough to
 run a coroutine on an interval without a user writing their own task
 bookkeeping. It is not a scheduler and has no cron syntax.
 
-    @bot.task(seconds=30)
+    @task_loop(seconds=30)
     async def announce():
         await bot.rest.send_message(CHANNEL, "tick")
 
-    announce.start()
-    ...
-    announce.cancel()
+    bot.start_task(announce)   # registers it so Client.close() cancels it
 
 The wrapped coroutine keeps its normal signature; the loop object is
 available as the ``this`` argument if you need it, mirroring discord.py.

@@ -74,9 +74,9 @@ def test_action_row_groups_buttons():
     assert len(row["components"]) == 2
 
 
-def test_action_row_rejects_non_buttons():
-    with pytest.raises(ValueError, match="build_action_row takes buttons"):
-        build_action_row(build_select("s", [{"label": "a", "value": "b"}]))
+def test_action_row_rejects_unknown_component_types():
+    with pytest.raises(ValueError, match="unsupported component type"):
+        build_action_row({"type": 99})
 
 
 def test_action_row_limit():
@@ -100,7 +100,7 @@ def test_string_select_shape():
         [{"label": "One", "value": "1", "default": True}],
         placeholder="pick",
     )
-    assert s["type"] == 4
+    assert s["type"] == 3
     assert s["options"][0]["default"] is True
     assert s["placeholder"] == "pick"
     assert s["max_values"] == 1
@@ -108,9 +108,21 @@ def test_string_select_shape():
 
 def test_user_select_has_no_options():
     s = build_select("cid", select_type=SELECT_USER, min_values=1, max_values=3)
-    assert s["type"] == 3  # SELECT_USER maps to component type 3
+    assert s["type"] == 5  # user select component type
     assert "options" not in s
     assert s["min_values"] == 1
+
+
+def test_action_row_accepts_one_select():
+    select = build_select("cid", [{"label": "One", "value": "1"}])
+    row = build_action_row(select)
+    assert row == {"type": 1, "components": [select]}
+
+
+def test_action_row_rejects_select_plus_button():
+    select = build_select("cid", [{"label": "One", "value": "1"}])
+    with pytest.raises(ValueError, match="must all be buttons"):
+        build_action_row(select, build_button("x", "b"))
 
 
 def test_select_option_limit():
@@ -122,7 +134,8 @@ def test_select_option_limit():
 def test_modal_and_text_input():
     modal = build_modal("mid", "Feedback", build_text_input("name", "Your name"))
     assert modal["custom_id"] == "mid"
-    assert modal["components"][0]["type"] == 4
+    assert modal["components"][0]["type"] == 1
+    assert modal["components"][0]["components"][0]["type"] == 4
     assert modal_response(modal)["type"] == MODAL_SUBMIT
 
 
@@ -167,7 +180,7 @@ def test_pong():
 
 
 def test_string_select_constant():
-    assert SELECT_STRING == 1
+    assert SELECT_STRING == 3
 
 
 # -- REST wiring ------------------------------------------------------------
@@ -187,14 +200,28 @@ def test_interaction_callback_puts():
     assert rec.calls[0][2]["json_data"] == response
 
 
+def test_interaction_callback_uploads_files():
+    rest, rec = rest_with([{}])
+    run(
+        rest.interaction_callback(
+            "i1", "tok", message_response("done"), files=[b"hello"]
+        )
+    )
+    assert rec.calls[0][:2] == ("PUT", "/interactions/i1/tok/callback")
+    fields = rec.calls[0][2]["fields"]
+    assert '"attachments"' in fields["payload_json"]
+    assert rec.calls[0][2]["files"][0]["field"] == "files[0]"
+
+
 def test_edit_and_fetch_original_response():
     rest, rec = rest_with([{"id": "m"}, {"id": "m"}])
-    run(rest.edit_interaction_response("app", "tok", content="x", session_id="s"))
-    run(rest.original_response("app", "tok", session_id="s"))
+    run(rest.edit_interaction_response("app", "tok", content="x"))
+    run(rest.original_response("app", "tok"))
     assert rec.calls[0][:2] == ("PATCH", "/webhooks/app/tok/messages/@original")
     assert rec.calls[0][2]["json_data"]["content"] == "x"
+    assert "session_id" not in rec.calls[0][2]["json_data"]
     assert rec.calls[1][:2] == ("GET", "/webhooks/app/tok/messages/@original")
-    assert rec.calls[1][2]["params"] == {"session_id": "s"}
+    assert rec.calls[1][2].get("params") is None
 
 
 # -- platform ---------------------------------------------------------------
@@ -206,10 +233,14 @@ def test_get_invite():
 
 
 def test_follow_channel():
-    rest, rec = rest_with([{"id": "n1"}])
-    run(rest.follow_channel("c1", target_channel_id="c2"))
-    assert rec.calls[0][:2] == ("POST", "/channels/followers")
-    assert rec.calls[0][2]["params"] == {"target_channel_id": "c2"}
+    rest, rec = rest_with(
+        [{"channel_id": "c1", "webhook_id": "w1"}]
+    )
+    followed = run(rest.follow_channel("c1", target_channel_id="c2"))
+    assert followed == {"channel_id": "c1", "webhook_id": "w1"}
+    assert rec.calls[0][:2] == ("POST", "/channels/c1/followers")
+    assert rec.calls[0][2]["json_data"] == {"webhook_channel_id": "c2"}
+    assert "params" not in rec.calls[0][2] or rec.calls[0][2]["params"] is None
 
 
 def test_webhook_lifecycle():
@@ -314,6 +345,7 @@ def test_rest_typing_loop_factory():
     assert isinstance(loop, TypingLoop)
     assert loop.channel_id == "c1"
     assert loop.interval == 5
+    assert rest.typing_loop("c1").interval == TYPING_REFRESH_S
 
 
 def test_one_shot_typing_still_works():

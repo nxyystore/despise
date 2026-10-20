@@ -32,19 +32,30 @@ BUTTON_PREMIUM = 6
 TEXT_INPUT_STYLE_SHORT = 1
 TEXT_INPUT_STYLE_PARAGRAPH = 2
 
-# Select menu types.
-SELECT_STRING = 1
-SELECT_USER = 2
-SELECT_ROLE = 3
-SELECT_MENTIONABLE = 4
-SELECT_CHANNEL = 5
+# Select menu types. These are the wire-level component types.
+SELECT_STRING = 3
+SELECT_USER = 5
+SELECT_ROLE = 6
+SELECT_MENTIONABLE = 7
+SELECT_CHANNEL = 8
+
+_SELECT_TYPES = {
+    SELECT_STRING,
+    SELECT_USER,
+    SELECT_ROLE,
+    SELECT_MENTIONABLE,
+    SELECT_CHANNEL,
+}
 
 MAX_BUTTONS = 5
 MAX_ACTIONS = 5
 MAX_LABEL_LENGTH = 80
+MAX_TITLE_LENGTH = 45
+MAX_TEXT_INPUT_LABEL_LENGTH = 45
 MAX_CUSTOM_ID_LENGTH = 100
 MAX_PLACEHOLDER_LENGTH = 150
 MAX_OPTIONS = 25
+MAX_OPTION_LENGTH = 100
 
 
 def _clip(value: str, limit: int, field: str) -> str:
@@ -87,14 +98,19 @@ def build_button(
 
 
 def build_action_row(*components: dict) -> dict:
-    """Wrap up to 5 components in a row (a button bar)."""
+    """Wrap components in a row.
+
+    A row holds up to five buttons, or exactly one select/text input. Selects
+    still need to be placed in an action row when attached to a message.
+    """
     if not components:
         raise ValueError("an action row needs at least one component")
     if len(components) > MAX_BUTTONS:
-        raise ValueError(f"at most {MAX_BUTTONS} buttons per action row")
-    for component in components:
-        if component.get("type") != 2:
-            raise ValueError("build_action_row takes buttons; use build_select for others")
+        raise ValueError(f"at most {MAX_BUTTONS} components per action row")
+    if len(components) > 1 and any(c.get("type") != 2 for c in components):
+        raise ValueError("multiple components in an action row must all be buttons")
+    if len(components) == 1 and components[0].get("type") not in (2, *_SELECT_TYPES, 4):
+        raise ValueError("unsupported component type in an action row")
     return {"type": 1, "components": list(components)}
 
 
@@ -109,8 +125,10 @@ def build_select(
     disabled: bool = False,
 ) -> dict:
     """A select menu. ``options`` is required for SELECT_STRING only."""
+    if select_type not in _SELECT_TYPES:
+        raise ValueError(f"unknown select type {select_type!r}")
     component = {
-        "type": 4 if select_type == SELECT_STRING else select_type + 1,
+        "type": select_type,
         "custom_id": _clip(custom_id, MAX_CUSTOM_ID_LENGTH, "custom_id"),
         "min_values": min_values,
         "max_values": max_values,
@@ -125,10 +143,10 @@ def build_select(
             raise ValueError(f"at most {MAX_OPTIONS} options per select")
         component["options"] = [
             {
-                "label": _clip(o.get("label", ""), MAX_LABEL_LENGTH, "option label"),
-                "value": _clip(o.get("value", ""), MAX_LABEL_LENGTH, "option value"),
+                "label": _clip(o.get("label", ""), MAX_OPTION_LENGTH, "option label"),
+                "value": _clip(o.get("value", ""), MAX_OPTION_LENGTH, "option value"),
                 "description": _clip(
-                    o.get("description", ""), MAX_LABEL_LENGTH, "option description"
+                    o.get("description", ""), MAX_OPTION_LENGTH, "option description"
                 ),
                 "emoji": o.get("emoji"),
                 "default": bool(o.get("default", False)),
@@ -153,7 +171,7 @@ def build_text_input(
     component = {
         "type": 4,
         "custom_id": _clip(custom_id, MAX_CUSTOM_ID_LENGTH, "custom_id"),
-        "label": _clip(label, MAX_LABEL_LENGTH, "label"),
+        "label": _clip(label, MAX_TEXT_INPUT_LABEL_LENGTH, "label"),
         "style": style,
         "required": required,
     }
@@ -169,14 +187,24 @@ def build_text_input(
 
 
 def build_modal(custom_id: str, title: str, *components: dict) -> dict:
+    """A modal. Text inputs are wrapped in the action rows Discord requires."""
     if not components:
         raise ValueError("a modal needs at least one input")
     if len(components) > MAX_ACTIONS:
         raise ValueError(f"at most {MAX_ACTIONS} inputs per modal")
+    rows = []
+    for component in components:
+        kind = component.get("type")
+        if kind == 1:
+            rows.append(component)
+        elif kind == 4:
+            rows.append({"type": 1, "components": [component]})
+        else:
+            raise ValueError("modal components must be text inputs or action rows")
     return {
         "custom_id": _clip(custom_id, MAX_CUSTOM_ID_LENGTH, "custom_id"),
-        "title": _clip(title, MAX_LABEL_LENGTH, "title"),
-        "components": list(components),
+        "title": _clip(title, MAX_TITLE_LENGTH, "title"),
+        "components": rows,
     }
 
 
@@ -185,11 +213,14 @@ def message_response(
     *,
     embeds: list | None = None,
     components: list | None = None,
-    files: list | None = None,
     ephemeral: bool = False,
     allowed_mentions: dict | None = None,
 ) -> dict:
-    """Callback type 4: reply to the interaction."""
+    """Callback type 4: reply to the interaction.
+
+    File uploads are not represented here; pass ``files=`` to
+    :meth:`Rest.interaction_callback` alongside the response.
+    """
     data: dict = {"tts": False}
     if content is not None:
         data["content"] = content
@@ -197,10 +228,6 @@ def message_response(
         data["embeds"] = embeds
     if components:
         data["components"] = components
-    if files:
-        data["attachments"] = [
-            {"id": i, "filename": getattr(f, "filename", "upload")} for i, f in enumerate(files)
-        ]
     if ephemeral:
         data["flags"] = 64  # EPHEMERAL
     if allowed_mentions is not None:
@@ -225,7 +252,7 @@ def update_response(
     return {"type": UPDATE_MESSAGE, "data": data}
 
 
-def defer(ephemeral: bool = False, thinking: bool = False) -> dict:
+def defer(ephemeral: bool = False) -> dict:
     """Callback type 5: acknowledge now, answer later."""
     data: dict = {}
     if ephemeral:

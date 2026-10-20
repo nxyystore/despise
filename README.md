@@ -73,7 +73,7 @@ Names: `ready`, `resume`, `message`, `message_edit`, `message_delete`, `guild_jo
 - A gateway that resumes from close codes, backs off with jitter, and replays presence after re identify.
 - Rate limiting keyed off Discord response headers, with per bucket locks and an account wide lock for `scope: user`.
 - Typed models with snowflake identity, parsed timestamps, and the raw payload kept on `.raw`.
-- REST coverage for messages, DMs, read state, guilds, members, roles, bans, friends, notes, profile edits, webhooks, and interactions.
+- REST coverage for messages, DMs, read state, guilds, members, roles, bans, friends, notes, profile and user settings, webhooks, and interactions.
 - Friendly event names with a raw-dict fallback, so an unmapped dispatch still fires the day Discord ships it.
 - Bounded entity cache plus a built in session cache. No extra installs.
 
@@ -137,7 +137,7 @@ Client(token, session_cache=True)                  # in memory, same process
 Client(token, session_cache="redis://127.0.0.1:6379/0")  # survives restarts
 ```
 
-With the cache on, a reconnect resumes from `session_id` plus last `seq` instead of sending a fresh Identify. Identify carries a per token rate limit, so a flapping connection without session memory burns budget and risks lockout. Two clients on one token share the entry through the `for_token` registry. Separate tokens stay separate. Entries expire after an hour. `close()` and fatal or fresh closes clear the entry.
+With the cache on, a reconnect resumes from `session_id` plus last `seq` instead of sending a fresh Identify. Identify carries a per token rate limit, so a flapping connection without session memory burns budget and risks lockout. Two clients on one token share the entry through the `for_token` registry, and the last one to close clears it. Separate tokens stay separate. Entries expire after an hour. Fatal or fresh sessions clear the stored state.
 
 ### Presence
 
@@ -148,9 +148,25 @@ await bot.clear_presence()
 
 Send presence after READY. The gateway throttles you to one update per 5 seconds per connection and replays your last presence on re identify.
 
+### Profile settings
+
+```python
+await bot.rest.set_bio("building things")
+await bot.rest.set_avatar_decoration("sku_id")             # None removes it
+await bot.rest.set_display_name_style(
+    font_id=3, effect_id=2, colors=[0xF4B400, 0xE91E63],
+)
+await bot.rest.set_guild_nickname(guild_id, "nick")       # None clears it
+await bot.rest.set_guild_bio(guild_id, "guild-specific bio")
+await bot.rest.set_custom_status("working", emoji="🛠️")
+await bot.rest.set_custom_status(None)                    # clear status
+```
+
+`edit_profile` covers `bio`, `pronouns`, `banner`, `accent_color`, `theme_colors`, and `profile_effect_id`. `edit_user` covers account fields such as `avatar_decoration_sku_id`, `global_name`, and the display-name style ids. `edit_guild_profile` is the per-guild equivalent. Nullable fields clear when passed `None`.
+
 ## REST
 
-`bot.rest` covers DMs, messages, reactions, read state, guilds, members, roles, bans, friends, profile, notes, and webhooks: `open_dm`, `create_group_dm`, `private_channels`, `send_message`, `edit_message`, `delete_message`, `fetch_message`, `history`, `crosspost_message`, `pinned_messages`, `pin`, `unpin`, `typing`, `add_reaction`, `clear_reactions`, `ack_message`, `ack_bulk`, `get_channel`, `edit_channel`, `delete_channel`, `edit_channel_permissions`, `accept_invite`, `get_guild`, `guild_preview`, `leave_guild`, `get_member`, `edit_member`, `kick_member`, `add_member_role`, `ban`, `unban`, `bans`, `create_role`, `edit_role`, `delete_role`, `get_user`, `user_profile`, `set_note`, `relationships`, `add_friend`, `block`, and more.
+`bot.rest` covers DMs, messages, reactions, read state, guilds, members, roles, bans, friends, profile and user settings, notes, and webhooks: `open_dm`, `create_group_dm`, `private_channels`, `send_message`, `edit_message`, `delete_message`, `fetch_message`, `history`, `crosspost_message`, `pinned_messages`, `pin`, `unpin`, `typing`, `add_reaction`, `clear_reactions`, `ack_message`, `ack_bulk`, `get_channel`, `edit_channel`, `delete_channel`, `edit_channel_permissions`, `accept_invite`, `get_guild`, `guild_preview`, `leave_guild`, `get_member`, `edit_member`, `kick_member`, `add_member_role`, `ban`, `unban`, `bans`, `create_role`, `edit_role`, `delete_role`, `get_user`, `user_profile`, `set_note`, `set_bio`, `set_avatar_decoration`, `set_display_name_style`, `set_guild_nickname`, `set_guild_bio`, `set_custom_status`, `relationships`, `add_friend`, `block`, and more.
 
 ### Sending
 
@@ -243,20 +259,20 @@ from despise import task_loop
 async def announce(task):
     await bot.rest.send_message(CHANNEL, "tick")
 
-announce.start()  # Client.close() cancels registered tasks
+bot.start_task(announce)  # registers it so Client.close() cancels it
 ```
 
 `Task` takes `jitter=` and `max_runs=` and keeps per run exceptions from stopping later runs.
 
 ## Cache and models
 
-`get_guild`, `get_channel`, and `get_user` check a small bounded cache first and fall through to REST on a miss. Gateway dispatches feed the cache, so entities you have seen cost no round trip. A failed fetch falls back to the cached copy instead of failing your handler.
+`get_guild`, `get_channel`, and `get_user` check a small bounded cache first and fall through to REST on a miss. Gateway dispatches feed the cache, so entities you have seen cost no round trip. Missing or inaccessible entities return `None`; transport, auth, and rate-limit errors propagate.
 
 ```python
 guild   = await bot.get_guild(gid)   # None on 404/403
 channel = await bot.get_channel(cid)
 user    = await bot.get_user(uid)
-member  = bot.get_member(uid, gid)   # cache only, sync
+member  = bot.get_member(uid, gid)   # cache only, sync (READY + member events)
 bot.clear_cache()
 ```
 
@@ -285,7 +301,7 @@ bot.modules.reload("general")         # picks up your edits
 bot.modules.unload("general")         # unhooks listeners, forgets commands
 ```
 
-Commands parse with shell style quoting, so `!say "hello world"` arrives as one arg. `ctx` carries `bot`, `message`, `name`, `args`, `text`, plus `reply` and `send`. Command errors dispatch as `command:ping`, so `bot.on_error("command:ping", ...)` scopes failure handling to one command. Set the prefix once with `Client("token", command_prefix=".")`.
+Commands parse with shell style quoting, so `!say "hello world"` arrives as one arg. `ctx` carries `bot`, `message`, `name`, `args`, `text`, plus `reply` and `send`. Command errors dispatch as `command:ping`, so `bot.on_error(handler, event="command:ping")` scopes failure handling to one command. Set the prefix once with `Client("token", command_prefix=".")`.
 
 ## Options
 
@@ -298,6 +314,8 @@ Commands parse with shell style quoting, so `!say "hello world"` arrives as one 
 | `session_cache` | `False` | `True` for memory, `redis://` URL for cross process |
 | `version_resolver` | `None` | pin version lookups |
 | `cache_caps` | `None` | `(guilds, channels, users)` caps; defaults 512/2048/4096 |
+| `command_prefix` | `"!"` | prefix for `cmd` modules |
+| `owner_ids` | `None` | user ids allowed by `checks.is_owner()` |
 
 ## Errors
 

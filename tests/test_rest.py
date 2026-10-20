@@ -2,12 +2,22 @@
 
 import asyncio
 import json
+from datetime import datetime, timezone
 
 import pytest
 
 from despise.client import Client
 from despise.headers import EphemeralIds, build_profile
-from despise.models import Channel, Guild, Member, Message, Relationship, Role, User
+from despise.models import (
+    Channel,
+    Embed,
+    Emoji,
+    Guild,
+    Member,
+    Message,
+    Role,
+    User,
+)
 from despise.rest import File, Rest, build_activity, set_presence
 
 EPH = EphemeralIds(client_launch_id="launch-1")
@@ -83,6 +93,12 @@ def test_send_message_optional_payloads():
     assert payload["message_reference"] == {"message_id": "m0"}
 
 
+def test_send_message_accepts_embed_models():
+    rest, rec = rest_with([{"id": "m1", "channel_id": "c1", "author": {}}])
+    run(rest.send_message("c1", embeds=[Embed({"title": "t", "color": 1})]))
+    assert rec.calls[0][2]["json_data"]["embeds"] == [{"title": "t", "color": 1}]
+
+
 def test_history_pagination_params():
     rest, rec = rest_with(
         [[{"id": "m1", "channel_id": "c", "author": {}}], {}, {}]
@@ -155,14 +171,16 @@ def test_relationships():
     assert rels[0].type_name == "friend"
     assert rels[0].user.username == "z"
 
-    added = run(rest.add_friend("u2"))
-    assert isinstance(added, Relationship)
+    added = run(rest.add_friend("u2", note="hi"))
+    assert added is None
+    assert rec.calls[1][2]["json_data"] == {"note": "hi"}
     assert rec.calls[1][2]["context"] == "friends"
     run(rest.remove_relationship("u2"))
     assert rec.calls[2][:2] == ("DELETE", "/users/@me/relationships/u2")
     blocked = run(rest.block("u3"))
+    assert blocked is None
     assert rec.calls[3][1] == "/users/@me/relationships/u3"
-    assert blocked.type_name == "blocked"
+    assert rec.calls[3][2]["json_data"] == {"type": 2}
 
 
 def test_build_activity():
@@ -494,7 +512,7 @@ def test_read_state_paths():
     run(rest.ack_guild("g1"))
     run(rest.ack_guild_feature("g1", 2, "e1"))
     run(rest.ack_user_feature(1, "m1"))
-    run(rest.delete_read_state("c1"))
+    run(rest.delete_read_state("c1", read_state_type=1))
     verbs = [(m, p) for m, p, _ in rec.calls]
     assert verbs == [
         ("POST", "/channels/c1/pins/ack"),
@@ -503,6 +521,7 @@ def test_read_state_paths():
         ("POST", "/users/@me/1/m1/ack"),
         ("DELETE", "/channels/c1/messages/ack"),
     ]
+    assert rec.calls[4][2]["json_data"] == {"read_state_type": 1}
 
 
 def test_ack_bulk_wraps_read_states():
@@ -586,8 +605,20 @@ def test_group_dm_and_private_channels():
     assert [c.id for c in chans] == ["c1", "g1"]
 
 
-def test_pinned_messages_unwraps_items():
-    rest, rec = rest_with([{"items": [{"id": "m1", "author": {}}]}])
+def test_pinned_messages_unwraps_pin_items():
+    rest, rec = rest_with(
+        [
+            {
+                "items": [
+                    {
+                        "pinned_at": "2026-10-20T00:00:00+00:00",
+                        "message": {"id": "m1", "author": {}},
+                    }
+                ],
+                "has_more": False,
+            }
+        ]
+    )
     pins = run(rest.pinned_messages("c1", limit=5))
     assert [m.id for m in pins] == ["m1"]
     assert rec.calls[0][2]["params"] == [("limit", "5")]
@@ -674,6 +705,87 @@ def test_user_profile_and_notes():
     assert run(rest.get_note("u1")) == "hi"
     run(rest.set_note("u1", "bye"))
     assert rec.calls[2][2]["json_data"] == {"note": "bye"}
+
+
+def test_edit_profile_and_bio():
+    rest, rec = rest_with([{"bio": "hi"}, {}])
+    run(rest.edit_profile(bio="hi", pronouns="they/them", accent_color=0xFF0000))
+    run(rest.set_bio(None))
+    assert rec.calls[0][:2] == ("PATCH", "/users/@me/profile")
+    assert rec.calls[0][2]["json_data"] == {
+        "bio": "hi",
+        "pronouns": "they/them",
+        "accent_color": 0xFF0000,
+    }
+    assert rec.calls[1][2]["json_data"] == {"bio": None}
+
+
+def test_avatar_decoration_and_display_name_style():
+    rest, rec = rest_with([{}, {}])
+    run(rest.set_avatar_decoration("sku1"))
+    run(
+        rest.set_display_name_style(
+            font_id=3, effect_id=2, colors=[0xFF0000, 0x00FF00]
+        )
+    )
+    assert rec.calls[0][:2] == ("PATCH", "/users/@me")
+    assert rec.calls[0][2]["json_data"] == {"avatar_decoration_sku_id": "sku1"}
+    assert rec.calls[1][2]["json_data"] == {
+        "display_name_font_id": 3,
+        "display_name_effect_id": 2,
+        "display_name_colors": [0xFF0000, 0x00FF00],
+    }
+
+
+def test_guild_profile_and_nickname():
+    rest, rec = rest_with(
+        [{"guild_id": "g1", "bio": "guild bio"}, {}, {"nick": "nick", "user": {"id": "u1"}}]
+    )
+    profile = run(rest.edit_guild_profile("g1", bio="guild bio", pronouns="any"))
+    run(rest.set_guild_bio("g1", None))
+    member = run(rest.set_guild_nickname("g1", "nick", reason="rename"))
+    assert profile["bio"] == "guild bio"
+    assert rec.calls[0][:2] == ("PATCH", "/guilds/g1/profile/@me")
+    assert rec.calls[0][2]["json_data"] == {"bio": "guild bio", "pronouns": "any"}
+    assert rec.calls[1][2]["json_data"] == {"bio": None}
+    assert rec.calls[2][:2] == ("PATCH", "/guilds/g1/members/@me")
+    assert rec.calls[2][2]["json_data"] == {"nick": "nick"}
+    assert rec.calls[2][2]["reason"] == "rename"
+    assert isinstance(member, Member)
+    assert member.nick == "nick"
+    assert member.guild_id == "g1"
+
+
+def test_custom_status_replaces_the_whole_status():
+    rest, rec = rest_with([{}, {}])
+    expires = datetime(2026, 1, 2, 3, 4, tzinfo=timezone.utc)
+    run(rest.set_custom_status("working", emoji="🛠️", expires_at=expires))
+    run(rest.set_custom_status(None))
+    first = rec.calls[0][2]["json_data"]["custom_status"]
+    assert rec.calls[0][:2] == ("PATCH", "/users/@me/settings")
+    assert first == {
+        "text": "working",
+        "emoji_id": None,
+        "emoji_name": "🛠️",
+        "expires_at": "2026-01-02T03:04:00+00:00",
+    }
+    assert rec.calls[1][2]["json_data"]["custom_status"] == {
+        "text": None,
+        "emoji_id": None,
+        "emoji_name": None,
+        "expires_at": None,
+    }
+
+
+def test_custom_status_accepts_custom_emoji_variants():
+    rest, rec = rest_with([{}, {}, {}])
+    run(rest.set_custom_status("a", emoji=Emoji({"id": "e1", "name": "blob"})))
+    run(rest.set_custom_status("b", emoji="<:blob:e1>"))
+    run(rest.set_custom_status("c", emoji="blob:e1"))
+    for call in rec.calls:
+        status = call[2]["json_data"]["custom_status"]
+        assert status["emoji_id"] == "e1"
+        assert status["emoji_name"] is None
 
 
 def test_get_note_defaults_to_empty_string():
