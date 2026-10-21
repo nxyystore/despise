@@ -22,7 +22,7 @@ jobs:
           set -euo pipefail
 
           git remote add gitlab \
-            "https://oauth2:${GITLAB_TOKEN}@gitlab.com/GROUP/PROJECT.git"
+            "https://oauth2:${GITLAB_TOKEN}@gitlab.com/nxyy/despise.git"
 
           git push gitlab \
             'refs/remotes/origin/*:refs/heads/*' \
