@@ -1,0 +1,29 @@
+name: Mirror to GitLab
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clone GitHub repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+
+      - name: Push branches and tags to GitLab
+        env:
+          GITLAB_TOKEN: ${{ secrets.GITLAB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          git remote add gitlab \
+            "https://oauth2:${GITLAB_TOKEN}@gitlab.com/GROUP/PROJECT.git"
+
+          git push gitlab \
+            'refs/remotes/origin/*:refs/heads/*' \
+            'refs/tags/*:refs/tags/*'
